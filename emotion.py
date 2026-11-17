@@ -117,17 +117,26 @@ def annotate_user_text(text: str, emotion: Optional[str], intensity: float = 0.0
     """Prefix a transcribed user turn with a compact affect tag.
 
     Kept terse and on one line so it cannot be mistaken for user content, and so
-    it costs little of the turn's own text. Neutral turns are returned
-    unchanged — annotating them would train the model to see noise as signal.
+    it costs little of the turn's own text. Neutral turns are returned unchanged —
+    annotating them would train the model to see noise as signal — with one
+    exception: if the *events* carry real affect evidence (crying, laughter), that
+    is dropped nowhere else and is exactly what a neutral label hides. Voice
+    activity and noise events stay silent, since they describe the recording
+    rather than the speaker.
     """
     key = normalise(emotion)
-    if key == "neutral" or not text:
+    interesting = [e for e in (events or [])
+                   if e.lower() not in {"speech", "speech_noise", "event_unk", "bgm"}]
+    if not text:
         return text
+    if key == "neutral":
+        # No emotion to report, but an affect-bearing event is still evidence.
+        if not interesting:
+            return text
+        return f"[voice: emotion=neutral events={','.join(interesting)}] {text}"
     tag = f"[voice: emotion={key} intensity={intensity:.1f}"
-    if events:
-        interesting = [e for e in events if e.lower() not in {"speech", "speech_noise", "event_unk", "bgm"}]
-        if interesting:
-            tag += " events=" + ",".join(interesting)
+    if interesting:
+        tag += " events=" + ",".join(interesting)
     return f"{tag}] {text}"
 
 
@@ -196,3 +205,50 @@ def reply_tempo(emotion: Optional[str], *, enabled: bool = True) -> Optional[flo
         return None
     spec = REPLY_PROSODY.get(normalise(emotion)) or {}
     return spec.get("tempo")
+
+
+# SenseVoice does not only label emotion — it reports audio *events*, and two of
+# them are direct affect evidence the emotion tag often misses. A crying speaker
+# frequently comes back `<|SAD|>` or even `<|NEUTRAL|>` because the vocal
+# realisation is flat, while `<|Cry|>` is unambiguous about what is happening;
+# `<|Laughter|>` likewise confirms a happy reading rather than a merely raised
+# voice. FunASR documents these tags as per-segment predictions, so they are
+# evidence about this utterance, not decoration.
+_EVENT_AFFECT: dict[str, dict] = {
+    # event     -> affect it argues for, and how strongly
+    "cry":       {"emotion": "sad",    "weight": 0.85},
+    "laughter":  {"emotion": "happy",  "weight": 0.55},
+}
+
+
+def infer_affect(emotion: Optional[str], events: Optional[list[str]] = None,
+                 intensity: float = 0.0) -> tuple[str, float, str]:
+    """Reconcile the emotion tag with the audio events.
+
+    Returns ``(emotion, intensity, why)``. The event only *upgrades* an affect the
+    emotion tag left ambiguous:
+      * a neutral or unknown reading is replaced by the event's affect — this is
+        the common case, since the label is per-segment and a flat read of a
+        crying speaker scores neutral;
+      * a reading that already agrees keeps its intensity, nudged up;
+      * a reading that explicitly disagrees is left alone (a laughing-but-angry
+        speaker is real), only the reason is reported.
+    """
+    key = normalise(emotion)
+    if not events:
+        return key, float(intensity or 0.0), "emotion only"
+    found = None
+    for raw in events:
+        hit = _EVENT_AFFECT.get(str(raw or "").strip().lower())
+        if hit:
+            found = hit
+            break
+    if found is None:
+        return key, float(intensity or 0.0), "emotion only"
+    target, weight = found["emotion"], found["weight"]
+    if key in ("neutral", "", "unknown"):
+        # No opinion from the label: the event is the only evidence there is.
+        return target, max(float(intensity or 0.0), weight), "event overrode an unnamed affect"
+    if key == target:
+        return key, min(1.0, max(float(intensity or 0.0), weight)), "event confirmed the label"
+    return key, float(intensity or 0.0), f"label and event disagree ({key} vs {target})"

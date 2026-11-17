@@ -105,6 +105,11 @@ class EmotionResult:
     language: str = ""
     raw_tokens: list[str] = field(default_factory=list)
     error: str = ""
+    # False when the model declined to name an affect (`<|EMO_UNKNOWN|>`) or
+    # emitted none. FunASR's guidance is not to fold that into NEUTRAL: "no
+    # opinion" and "calm" are different evidence, and only the second should
+    # steer a reply. `emotion` stays "neutral" so lookups still resolve.
+    detected: bool = True
 
     @property
     def ok(self) -> bool:
@@ -313,13 +318,25 @@ def _result_from_tokens(text: str, *, emotion: str = "", event: str = "", langua
     # SentencePiece marks word starts with "▁"; a joiner is what human-facing
     # text wants in every language this model covers.
     cleaned = (text or "").replace("▁", " ").strip()
-    # EMO_UNKNOWN is the model declining to name an affect, not a distinct one:
-    # report it as neutral so `emotion_mod.normalise` does not have to guess and
-    # so callers never carry a label the prosody table has no entry for.
-    if emo == "emo_unknown":
-        emo = ""
-    return EmotionResult(text=cleaned, emotion=emo or "neutral", intensity=intensity,
-                         events=events, language=lang, raw_tokens=list(raw_tokens or []))
+    # EMO_UNKNOWN is the model declining to name an affect — it is NOT neutral and
+    # NOT a low-confidence neutral. FunASR's own guidance is explicit: "Send
+    # unknown or unparseable results for inspection instead of silently turning
+    # them into NEUTRAL", and it warns that `ban_emo_unk=True` only masks the
+    # token's decoding score without providing new evidence. Collapsing it to
+    # `neutral` here made "the model has no opinion" indistinguishable from "the
+    # model says calm", so a caller could not tell a firm neutral from a shrug.
+    # `detected=False` carries that distinction; `emotion` stays "neutral" so the
+    # prosody table still has an entry.
+    unknown = emo == "emo_unknown" or not emo
+    return EmotionResult(
+        text=cleaned,
+        emotion="neutral" if unknown else emo,
+        intensity=intensity,
+        events=events,
+        language=lang,
+        raw_tokens=list(raw_tokens or []),
+        detected=not unknown,
+    )
 
 
 # --------------------------------------------------------------------------- backends
@@ -637,6 +654,10 @@ def make_stt_provider(detector: SenseVoiceEmotion, *, on_result=None,
                     logger.debug("sensevoice: reporting affect failed", exc_info=True)
             return {"success": True, "transcript": result.text, "provider": self.name,
                     "emotion": result.emotion, "events": list(result.events),
-                    "language": result.language}
+                    "language": result.language,
+                    # `emotion` is "neutral" both for a confident neutral and for
+                    # "the model declined" — this is the only way a consumer can
+                    # tell them apart without re-parsing raw tokens.
+                    "emotion_detected": result.detected}
 
     return SenseVoiceSTT(detector)

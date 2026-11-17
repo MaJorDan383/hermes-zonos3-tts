@@ -333,6 +333,44 @@ and `voice_emotion_state` (read the pending affect).
 | `sensevoice_threads` | `2` | Decoding threads; 2 measured fastest on this i7-12700K |
 | `stt_enabled` | `false` | Register the `sensevoice` STT provider (set `stt.provider: sensevoice` to use it) |
 
+### Emotion: what SenseVoice actually gives you
+
+FunASR's own guidance shapes three decisions here, and each replaced an earlier
+simplification:
+
+**`EMO_UNKNOWN` is not `NEUTRAL`.** The docs say plainly: *"Send unknown or
+unparseable results for inspection instead of silently turning them into
+NEUTRAL"*, and warn that `ban_emo_unk=True` only masks the unknown token's
+decoding score *without providing new evidence* — so banning it fabricates a
+label rather than improving one. `EmotionResult.detected` now carries the
+distinction (the STT envelope exposes it as `emotion_detected`), and `emotion`
+stays `"neutral"` so lookups still resolve. Measured on a synthesised clip:
+`emotion=neutral, detected=False` — the model genuinely had no opinion about
+synthetic speech, which is useful to know and was previously indistinguishable
+from a confident neutral.
+
+**Audio events are affect evidence, not decoration.** The model emits
+`<|Cry|>`, `<|Laughter|>`, `<|Applause|>`, `<|BGM|>` and friends alongside the
+emotion tag. A crying speaker often reads `NEUTRAL` because the vocal
+realisation is flat, while `Cry` is unambiguous. `emotion.infer_affect()`
+reconciles the two: an event *upgrades* an unnamed or neutral reading
+(`neutral + Cry → sad, 0.85`), confirms an agreeing label (`happy + Laughter →
+happy, 0.55`), and **never overrides an explicit disagreement** — a
+laughing-but-angry speaker is real, so `angry + Cry` stays angry and only the
+disagreement is logged.
+
+**Neutral turns are still unannotated — with one exception.** Adding
+`[voice: emotion=neutral]` to every turn would train the model to read noise as
+signal, so it stays silent. But if the events carry real affect (`Cry`,
+`Laughter`), that is dropped nowhere else and is exactly what the neutral label
+hides, so those turns get `[voice: emotion=neutral events=Cry]`. Recording
+artefacts (`Speech`, `Speech_Noise`, `BGM`) never do.
+
+**Intensity is a margin, not a probability.** The `onnx` backend maps the winning
+token's CTC posterior from 0.45–0.95 onto 0–1, calibrated against measured
+real-speech posteriors; below 0.45 is a marginal call. `sherpa` reports the label
+only, so intensity is `None` there rather than a fabricated number.
+
 ### Audio ducking (Windows)
 
 Raising the file's loudness stops helping once it is already louder than the

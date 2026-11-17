@@ -2004,18 +2004,42 @@ class EmotionPipeline:
             return {"ok": False, "reason": "emotion pipeline disabled"}
         if not getattr(result, "ok", False):
             return {"ok": False, "reason": getattr(result, "error", "recognition failed")}
+        # Reconcile the per-segment emotion tag with the audio events before
+        # anything acts on it: a crying speaker often reads as NEUTRAL, while
+        # `<|Cry|>` is unambiguous. See emotion.infer_affect.
+        events = list(result.events)
+        raw_intensity = result.intensity if result.intensity is not None else 0.0
+        detected = getattr(result, "detected", True)
+        if emotion_mod is not None and hasattr(emotion_mod, "infer_affect"):
+            if detected:
+                emotion, intensity, why = emotion_mod.infer_affect(
+                    result.emotion, events, raw_intensity)
+            else:
+                # The model declined to name an affect. Only an event can supply
+                # one; a bare EMO_UNKNOWN must not steer the reply either way.
+                emotion, intensity, why = emotion_mod.infer_affect(
+                    "neutral", events, raw_intensity)
+                if emotion == "neutral":
+                    why = "no affect detected"
+        else:
+            # Emotion module unavailable: keep the raw label, don't invent one.
+            emotion = result.emotion or "neutral"
+            intensity, why = raw_intensity, "emotion only"
+        if why != "emotion only" and why != "no affect detected":
+            logger.debug("zonos3-tts: affect %s -> %s (%.2f): %s",
+                         result.emotion, emotion, intensity, why)
         with self._lock:
-            self._emotion = result.emotion
-            self._intensity = result.intensity if result.intensity is not None else 0.0
-            self._events = list(result.events)
+            self._emotion = emotion
+            self._intensity = intensity
+            self._events = events
             self._at = time.time()
             self._turn_consumed = False
         # Arm the reply voice now, so the synthesis that follows this turn
         # already sounds right.
         if self.prosody:
             self._apply_reply_voice()
-        return {"ok": True, "emotion": result.emotion, "intensity": result.intensity,
-                "events": result.events, "text": result.text}
+        return {"ok": True, "emotion": emotion, "intensity": intensity or None,
+                "events": events, "text": result.text, "affect_source": why}
 
     def _apply_reply_voice(self) -> None:
         controls = emotion_mod.reply_prosody(self._emotion, self._intensity,
