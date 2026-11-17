@@ -305,18 +305,32 @@ class EngineClient:
             def _chunks():
                 carry = b""
                 frame = 4 if fmt != "pcm16" else 2
-                while True:
-                    block = resp.read(65536)
-                    if not block:
-                        break
-                    block = carry + block
-                    usable = len(block) - (len(block) % frame)
-                    carry = block[usable:]
-                    if usable:
-                        pcm = _convert(block[:usable])
-                        if pcm:
-                            yield pcm
-                # a trailing partial sample is dropped, never misaligned
+                try:
+                    while True:
+                        block = resp.read(65536)
+                        if not block:
+                            break
+                        block = carry + block
+                        usable = len(block) - (len(block) % frame)
+                        carry = block[usable:]
+                        if usable:
+                            pcm = _convert(block[:usable])
+                            if pcm:
+                                yield pcm
+                    # a trailing partial sample is dropped, never misaligned
+                finally:
+                    # Barge-in departs by breaking out of the consumer's for-loop,
+                    # which abandons this generator mid-iteration. Without this the
+                    # socket stays open, the engine's writer keeps succeeding, and
+                    # it decodes the rest of the utterance into a buffer nobody
+                    # reads — burning the GPU exactly when the user is talking.
+                    # The engine cancels on a gone response (generate.cpp: "the
+                    # response is gone ... stop generating"), so closing here is
+                    # what actually stops the work.
+                    try:
+                        resp.close()
+                    except Exception:  # noqa: BLE001 - teardown must not raise
+                        pass
 
             return rate, channels, _chunks()
         except Exception:
@@ -1420,23 +1434,36 @@ class Zonos3TTS(TTSProvider):
         if not text or not text.strip():
             return
         payload = self._payload(text, voice, speed, extra)
+        chunks = None
         try:
-            rate, _channels, chunks = self._sup.client.generate_pcm(
-                payload, timeout=self._sup.request_timeout)
+            try:
+                rate, _channels, chunks = self._sup.client.generate_pcm(
+                    payload, timeout=self._sup.request_timeout)
+            except (urllib.error.URLError, ConnectionError, OSError) as exc:
+                # A stopped engine must not look like a broken stream: restart and
+                # retry once, mirroring synthesize().
+                logger.info("zonos3-tts: streaming engine was down (%s); restarting", exc)
+                self._sup.ensure_up()
+                rate, _channels, chunks = self._sup.client.generate_pcm(
+                    payload, timeout=self._sup.request_timeout)
             # Record the engine's own rate before yielding, so the host opens the
             # device at 44100 rather than its 24000 default.
             self.stream_sample_rate = int(rate)
-            yield from chunks
-        except (urllib.error.URLError, ConnectionError, OSError) as exc:
-            # A stopped engine must not look like a broken stream: restart and
-            # retry once, mirroring synthesize().
-            logger.info("zonos3-tts: streaming engine was down (%s); restarting", exc)
-            self._sup.ensure_up()
-            rate, _channels, chunks = self._sup.client.generate_pcm(
-                payload, timeout=self._sup.request_timeout)
-            self.stream_sample_rate = int(rate)
-            yield from chunks
+            # Iterate explicitly rather than `yield from`: the host barges in by
+            # breaking out of its loop, which never calls close() on us. An
+            # explicit loop means that break propagates as GeneratorExit HERE, so
+            # the `finally` below closes the HTTP response — and a closed response
+            # is what makes the engine stop decoding. `yield from` would hand the
+            # abandonment to the inner generator without this frame ever learning
+            # about it.
+            for chunk in chunks:
+                yield chunk
         finally:
+            if chunks is not None:
+                try:
+                    chunks.close()
+                except Exception:  # noqa: BLE001 - teardown must not raise
+                    pass
             self._sup.mark_warm()
 
     def synthesize(self, text: str, output_path: str, *, voice: Optional[str] = None,
