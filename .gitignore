@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local state, logs and generated audio
+*.log
+*.wav
+*.mp3
+*.ogg
+_engine_state.json
+_unload_request.json*
+runtime/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
