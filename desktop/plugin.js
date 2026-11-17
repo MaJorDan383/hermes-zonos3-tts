@@ -164,6 +164,13 @@ function ZonosChip({ ctx }) {
                 state.ok && state.voices
                   ? jsx('div', { children: `Voice: ${state.voice || '—'} (${state.voices} available)` })
                   : null,
+                state.ok
+                  ? jsx('div', {
+                    children: state.streams_pcm
+                      ? `Streaming: native ${state.stream_sample_rate} Hz`
+                      : 'Streaming: per-sentence (buffered)'
+                  })
+                  : null,
                 state.ok && state.last_error
                   ? jsx('div', { children: `Last error: ${state.last_error}` })
                   : null

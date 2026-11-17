@@ -1667,6 +1667,11 @@ class _StatePublisher:
                 "emotion": self.provider.current_emotion(),
                 "emotion_pipeline": self.pipeline.snapshot() if self.pipeline else None,
                 "ducking": self.ducker.snapshot() if self.ducker else None,
+                # Streaming is decided by the provider, not the engine, so it is
+                # stamped here. Without it, "is the raw-PCM path live?" is
+                # unanswerable from outside the process that owns the object.
+                "streams_pcm": bool(getattr(self.provider, "streams_pcm", False)),
+                "stream_sample_rate": int(getattr(self.provider, "stream_sample_rate", 0) or 0),
                 "updated_at": time.time(),
                 "agent_pid": os.getpid(),
             }
