@@ -112,6 +112,12 @@ hermes config set plugins.entries.zonos3-tts.settings.unload_after_seconds 300
 | `steer_hold` | `0.35` | Steer-then-hold: dose multiplier after the onset. `1` = constant push (old behaviour). **Only sent when the live bundle advertises `steer_release`** |
 | `steer_onset_seconds` | `4.0` | Seconds at full dose before the ramp begins |
 | `steer_ramp_seconds` | `1.0` | Linear ramp length from full dose to `steer_hold` |
+| `headroom_db` | unset | Engine output gain. Unset keeps the server default (3 dB attenuation); `0` recovers that 3 dB for free, measured +3.0 dB peak and RMS. Below 0 is a 422 |
+
+**Every request object is CLOSED.** An unknown field is a **422**, not a no-op —
+measured, even `speed: 1.0` and `tag_cfg_scale: 1.0` are rejected. The plugin
+therefore drops any field the engine schema does not list (`_ENGINE_FIELDS`)
+instead of passing caller kwargs straight through.
 
 Every setting except the ones read once at `register()` is re-read live, so a
 status-chip change applies on the next release without restarting Hermes.
@@ -449,7 +455,7 @@ and splices the PCM into one WAV with rewritten sizes. Nothing is dropped and th
 header stays honest. Before this, a long reply was either cut short or killed the
 engine mid-session.
 
-### Steer then hold: withheld on bundles that lack the block
+### Steer then hold: the bundle lacks it, so the plugin approximates it
 
 Zyphra's guide documents `steer_release` (`{onset_seconds, ramp_seconds, hold,
 exempt}`): request-level hidden `controls` run at full dose for `onset_seconds`,
@@ -459,20 +465,21 @@ liveliness + valence + arousal climb towards shouting. Their measurement: a stac
 voice design held constant climbed in **19 of 24 takes** (+7.2 st, +7.0 dB), while
 hold 0.35 gave +0.6 st / +5.2 dB with neutral's climb count.
 
-That is exactly the risk of this plugin's defaults (`expressive 4` + `pitch_range
-1.5` are a stacked design), so the settings exist — `steer_hold`,
-`steer_onset_seconds`, `steer_ramp_seconds`, defaulting to 0.35 / 4 / 1.
+**This bundle predates the block:** `GET /v2/capabilities` and `/v2/controls` both
+report `steer_release: null`, and `steer_hold < 1` without it is a hard 400. So the
+engine cannot ramp the push for us.
 
-**But this bundle predates the block:** `GET /v2/capabilities` and `/v2/controls`
-both report `steer_release: null`, and `steer_hold < 1` without it is a hard 400. So
-the plugin sends the fields **only when the live server advertises the block**, and
-keeps the constant-push behaviour otherwise. When you update `steer.gguf` to a
-bundle that carries `steer_release`, the hold engages with no config change.
+`steer_scale()` therefore applies the same curve **client-side, per request**: it
+estimates the utterance's duration (~14 chars/second, measured), and once past
+onset + ramp it scales every prosody control down to `steer_hold`. A short reply
+finishes before the onset and is untouched; a long one stops accumulating pitch and
+loudness. When a future bundle carries `steer_release`, the plugin sends the real
+fields instead and the estimate stops mattering.
 
-Two related doc features are **unavailable here**, both capability-gated:
-reading-position span steering needs `laci_languages` (this build reports `[]`), and
-`control_spans` editorial emphasis needs that too. Check `GET /v2/capabilities`
-before assuming either.
+Two further doc features are **unavailable on this build**, both capability-gated:
+reading-position span steering and `control_spans` emphasis need `laci_languages`
+(reported as `[]`), and `short_text` (the 1–2-word filler trick) needs
+`pause_tokens` (reported as `null`). Both were checked, not assumed.
 
 ### Streaming: native rate, no resampling
 

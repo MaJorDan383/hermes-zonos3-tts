@@ -116,6 +116,28 @@ _DEFAULT_STEER_ONSET = 4.0
 _DEFAULT_STEER_RAMP = 1.0
 _UNSET = object()
 
+# Every field `POST /v2/generate` (GenerateRequest) accepts. The object is CLOSED:
+# any other key is a 422 ("instance invalid as per false-schema"), measured even
+# for a no-op value like `speed: 1.0`. Taken from docs/api.md + the OpenAPI schema,
+# so unknown caller kwargs are dropped instead of failing the utterance.
+_ENGINE_FIELDS = frozenset({
+    "text", "language", "text_normalization", "stream", "stream_decode",
+    "stream_codebooks", "stream_codebooks_scope", "format", "seed",
+    "temperature", "topk", "top_p", "min_p",
+    "repetition_window", "repetition_penalty", "repetition_codebooks",
+    "max_tokens", "speaker_audio_base64", "speaker_embedding_base64",
+    "speaker_embedding_id", "speaker_reference_codes", "speaker_mode",
+    "speaker_blend_embedding_id_a", "speaker_blend_embedding_id_b",
+    "speaker_blend_t", "speaker_cfg_scale", "condition_buckets",
+    "condition_values", "silence_prefill_frames", "start_immediately",
+    "accent", "accent_strength", "controls", "control_spans",
+    "control_span_rate", "control_span_follow", "control_span_lead",
+    "control_span_lag", "controls_cfg_scale",
+    "steer_hold", "steer_onset_seconds", "steer_ramp_seconds",
+    "laci", "short_text", "decoder", "headroom_db", "fade_out_ms",
+    "decode_context",
+})
+
 # --------------------------------------------------------------------------- emotion
 
 # SenseVoice emotion labels -> ZONOS3 steering directions, verified against
@@ -342,18 +364,28 @@ def _split_for_engine(text: str, budget: int) -> list[str]:
     split prefers ``.!?`` followed by whitespace, falls back to ``,;:`` and then to
     a hard cut on whitespace, so a piece never lands mid-word. Nothing is dropped:
     the join of the pieces is the original text apart from collapsed spacing.
+
+    Marker-safe: the start marker (U+E002) and the pause markers (U+E003-U+E006)
+    are only legal on a checkpoint that has them, and only as the first character
+    (start) or after a word and its glued punctuation (pause). A naive split can
+    leave one of those private-use characters at the head of a later piece, which
+    the engine answers with a 400. So any orphaned marker in a non-first piece is
+    stripped, and a first-piece start marker is preserved.
     """
+    import re
+
+    # Private-use markers the checkpoint may tokenize. Everything else in this
+    # range is left alone: a caller's own text may legitimately contain it.
+    _MARKERS = "\ue002\ue003\ue004\ue005\ue006"
+
     text = text.strip()
     if len(text) <= budget:
         return [text]
 
-    import re
-    # Ranked boundary patterns: sentence end, then clause, then any space.
     boundaries = [r'(?<=[.!?])\s+', r'(?<=[,;:])\s+', r'\s+']
     pieces: list[str] = []
     rest = text
     while len(rest) > budget:
-        head, tail = rest[:budget], rest[budget:]
         cut = -1
         for pattern in boundaries:
             candidates = [m.start() for m in re.finditer(pattern, rest[:budget])]
@@ -368,7 +400,13 @@ def _split_for_engine(text: str, budget: int) -> list[str]:
         rest = rest[cut:].lstrip()
     if rest.strip():
         pieces.append(rest.strip())
-    return pieces
+
+    # Keep a start marker only at the very beginning; drop markers that a cut
+    # stranded at the head of a later piece (they would be a 400 there).
+    return [
+        piece if index == 0 else piece.lstrip(_MARKERS).lstrip()
+        for index, piece in enumerate(pieces)
+    ]
 
 
 def _merge_wav(parts: list[bytes]) -> bytes:
@@ -461,6 +499,8 @@ class EngineSupervisor:
         self._held = False
         self._publisher = None
         self._voices: list[dict] = []
+        # speaker id -> controls the server reports as inert for it
+        self._disabled_cache: dict[str, frozenset[str]] = {}
 
     # -- settings ---------------------------------------------------------
     def _live(self, key: str, fallback: float) -> float:
@@ -885,6 +925,32 @@ class EngineSupervisor:
             self._voices = people
         return self._voices
 
+    def disabled_controls(self, speaker_id: Optional[str]) -> frozenset[str]:
+        """Controls the server says do nothing for *speaker_id*.
+
+        `GET /v2/speakers` reports each voice's `disabled_controls` — the control
+        ids whose calibrated dose is 0 for that voice. Sending one is not an
+        error, but it spends dose budget on a direction that cannot move.
+        Cached per id: the list is static for a loaded checkpoint.
+        """
+        if not speaker_id:
+            return frozenset()
+        cached = self._disabled_cache.get(speaker_id)
+        if cached is not None:
+            return cached
+        found: frozenset[str] = frozenset()
+        try:
+            people = self.voices(refresh=True)
+            for person in people:
+                if person.get("id") == speaker_id:
+                    found = frozenset(
+                        str(c) for c in (person.get("disabled_controls") or []))
+                    break
+        except Exception:  # noqa: BLE001 - a probe must not break speech
+            found = frozenset()
+        self._disabled_cache[speaker_id] = found
+        return found
+
     def resolve_voice(self, voice: Optional[str]) -> Optional[str]:
         """Map a name ("Savannah") or an id to a speaker id the server accepts.
 
@@ -953,7 +1019,8 @@ class Zonos3TTS(TTSProvider):
                  volume_boost: float = 0.0, streams_pcm: bool = False,
                  steer_hold: Optional[float] = None,
                  steer_onset: Optional[float] = None,
-                 steer_ramp: Optional[float] = None):
+                 steer_ramp: Optional[float] = None,
+                 headroom_db: Optional[float] = None):
         self._sup = supervisor
         self._base_options = dict(options or {})
         self._emotion_aware = emotion_aware
@@ -976,31 +1043,69 @@ class Zonos3TTS(TTSProvider):
         self._steer_ramp = float(steer_ramp if steer_ramp is not None else _DEFAULT_STEER_RAMP)
         self._steer_release: Any = _UNSET
         self._max_frames: Optional[int] = None
+        # 0 recovers the engine's default 3 dB attenuation for free; None leaves
+        # the server default alone rather than assuming it.
+        self._headroom_db = None if headroom_db is None else max(0.0, float(headroom_db))
         # Hermes only takes the raw-PCM path when this is true AND
         # stream_sample_rate is valid; the rate is read from the engine's own
         # X-Audio-Sample-Rate header at stream time, so this is just the opt-in.
         self.streams_pcm = bool(streams_pcm)
         self.stream_sample_rate = 44100  # provisional; the stream overwrites it
 
-    def prosody_controls(self, has_clip_voice: bool = False) -> dict[str, float]:
+    def prosody_controls(self, has_clip_voice: bool = False,
+                         scale: float = 1.0) -> dict[str, float]:
         """Always-on shaping applied on top of emotion controls.
 
         Measured on this host (baseline F0 spread 3.17 st):
           pitch.pitch_range +2 -> 5.93 st, expressive +16 -> 4.25 st,
           delivery.loud 4 -> +4.7 dB peak / +6.8 dB RMS.
-        ``delivery.loud`` is the engine's only real amplification; mood.loudness
+        ``delivery.loud`` is the engine's only real gain; mood.loudness
         measured no gain (-2.2 dB peak) and is deliberately not used.
+
+        *scale* damps the whole set for a long utterance. See
+        :meth:`steer_scale` for why.
         """
+        s = max(0.0, min(1.0, float(scale)))
         out: dict[str, float] = {}
         if self._expressive:
-            out["expressive.expressive"] = round(self._expressive, 3)
+            out["expressive.expressive"] = round(self._expressive * s, 3)
         if self._volume_boost:
-            out["delivery.loud"] = round(self._volume_boost, 3)
+            out["delivery.loud"] = round(self._volume_boost * s, 3)
         # A reference-clip voice is conditioned on raw audio codes, so moving the
         # embedding cannot apply; the engine 400s instead of ignoring it.
         if self._dynamic_range and not has_clip_voice:
-            out["pitch.pitch_range"] = round(self._dynamic_range, 3)
+            out["pitch.pitch_range"] = round(self._dynamic_range * s, 3)
         return out
+
+    def steer_scale(self, text: str, hold: Optional[float] = None) -> float:
+        """Client-side stand-in for the bundle's `steer_release` (steer-then-hold).
+
+        The guide measured what a constant hidden push does over a long line: the
+        model copies the style of the speech it has already generated, so stacked
+        liveliness + valence + arousal climb in pitch and loudness — a stacked
+        design went +7.2 st and +7.0 dB after the first 5 s in 19 of 24 takes.
+        The engine fixes that with `steer_release` (full dose for an onset, ramp,
+        then hold), but **this bundle does not ship it** (`/v2/capabilities`
+        `steer_release: null`), so we cannot ask for the ramp.
+
+        So the same curve is applied here, per request: estimate how long the text
+        will take, and damp the controls to `hold` once past onset + ramp. Short
+        utterances are unaffected (they finish before the onset); a long one stops
+        accumulating. The estimate is deliberately conservative — speech runs about
+        14 characters per second at this voice, measured across this plugin's
+        renders.
+        """
+        h = self._steer_hold if hold is None else float(hold)
+        if not (0.0 <= h < 1.0):
+            return 1.0
+        seconds = max(0.0, len(text) / 14.0)
+        onset, ramp = self._steer_onset, max(1e-3, self._steer_ramp)
+        if seconds <= onset:
+            return 1.0
+        if seconds >= onset + ramp:
+            return h
+        return 1.0 - (1.0 - h) * ((seconds - onset) / ramp)
+
 
 
     # -- lease hooks ------------------------------------------------------
@@ -1163,7 +1268,15 @@ class Zonos3TTS(TTSProvider):
             return base64.b64encode(out.read_bytes()).decode()
 
     def _payload(self, text: str, voice: Optional[str], speed: Optional[float],
-                 extra: dict) -> dict:
+                 extra: dict, speaker: Optional[str] = None,
+                 clip_b64: Optional[str] = None) -> dict:
+        """Build a GenerateRequest.
+
+        *speaker* / *clip_b64* let a caller that renders several chunks resolve and
+        encode the voice ONCE. Without them each chunk re-resolves the voice (a
+        speaker-list round trip) and, for a cloned clip, re-runs ffmpeg — minutes
+        of wasted work on a long reply.
+        """
         payload: dict[str, Any] = {
             "text": text,
             "language": self._language,
@@ -1175,9 +1288,11 @@ class Zonos3TTS(TTSProvider):
         # this checkpoint rejects embedding files outright, so silently accepting
         # a clip and falling back to the default voice would be a lie the user
         # would hear as "it ignored my sample".
-        speaker = None
         clip_voice = (voice or "").strip()
-        if clip_voice and Path(clip_voice).suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}:
+        if clip_b64 is not None:
+            payload["speaker_audio_base64"] = clip_b64
+            payload["speaker_mode"] = "reference"
+        elif clip_voice and Path(clip_voice).suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}:
             if not self._sup.cloning_supported:
                 raise RuntimeError(
                     "zonos3-tts: cloning from an audio clip needs zac-encoder.gguf and "
@@ -1186,9 +1301,9 @@ class Zonos3TTS(TTSProvider):
             payload["speaker_audio_base64"] = self._encode_clip(Path(clip_voice))
             payload["speaker_mode"] = "reference"
         else:
-            speaker = self._sup.resolve_voice(voice)
-            if speaker:
-                payload["speaker_embedding_id"] = speaker
+            resolved = speaker if speaker else self._sup.resolve_voice(voice)
+            if resolved:
+                payload["speaker_embedding_id"] = resolved
                 # `pitch.pitch_range` re-projects the speaker embedding, so the
                 # server refuses it (400) unless the mode is `embedding`. The
                 # default mode for a bundled voice id is `reference`, which is
@@ -1229,10 +1344,28 @@ class Zonos3TTS(TTSProvider):
         # Always-on prosody last, so a configured baseline cannot be silently
         # dropped by an emotion preset that happens to name the same direction.
         if self.steering_supported:
-            for key, value in self.prosody_controls(bool(payload.get("speaker_audio_base64"))).items():
+            # Damp the shaping for a long line: this bundle has no `steer_release`,
+            # so the engine cannot ramp it and a constant push accumulates.
+            scale = self.steer_scale(text)
+            for key, value in self.prosody_controls(
+                    bool(payload.get("speaker_audio_base64")), scale).items():
                 controls.setdefault(key, value)
         if controls:
-            payload["controls"] = controls
+            # A speaker may declare controls that do nothing for it
+            # (`disabled_controls` from GET /v2/speakers — the calibrated dose is 0).
+            # Sending them is not an error, but it wastes the dose budget and, when
+            # several share a source, dilutes the ones that do work. Drop them.
+            disabled = self._sup.disabled_controls(payload.get("speaker_embedding_id"))
+            if disabled:
+                dropped = [k for k in controls if k in disabled]
+                if dropped:
+                    logger.debug("zonos3-tts: dropping %d disabled control(s) for this "
+                                 "voice: %s", len(dropped), dropped)
+                    controls = {k: v for k, v in controls.items() if k not in disabled}
+            if controls:
+                payload["controls"] = controls
+            else:
+                payload.pop("controls", None)
             # Steer-then-hold: only meaningful when something is actually being
             # steered, and only sendable when the bundle advertises the block.
             # Without it, `steer_hold < 1` is a hard 400, so the capability is
@@ -1242,13 +1375,31 @@ class Zonos3TTS(TTSProvider):
                 payload.setdefault("steer_onset_seconds", round(self._steer_onset, 2))
                 payload.setdefault("steer_ramp_seconds", round(self._steer_ramp, 2))
 
+        # The engine attenuates every request by `headroom_db: 3` (the default) and
+        # then runs a soft limiter above -1 dBFS. Passing 0 recovers that 3 dB for
+        # free, with no post-processing — measured +3.0 dB peak and +3.0 dB RMS on
+        # this host. Values below 0 are a 422, so the floor is 0.
+        if self._headroom_db is not None:
+            payload.setdefault("headroom_db", float(self._headroom_db))
+
         # Pass through engine request fields (seed, temperature, guidance_scale,
-        # accent, condition_values, …). The engine rejects unknown keys with a
-        # clear 400/422 rather than ignoring them, which is the behaviour we want.
+        # accent, condition_values, …). Every request object on this server is
+        # CLOSED: an unknown field is a 422, not a no-op — measured, even
+        # `speed: 1.0` and `tag_cfg_scale: 1.0` are rejected. So anything the host
+        # hands us that the engine does not accept must be dropped here, or one
+        # caller kwarg (the host's own `speed`, `voice_compatible`, …) would take
+        # the whole utterance down with a validation error.
         for key, value in extra.items():
-            if value is not None and key not in payload and not key.startswith("_"):
-                payload[key] = value
+            if value is None or key in payload or key.startswith("_"):
+                continue
+            if _ENGINE_FIELDS and key not in _ENGINE_FIELDS:
+                logger.debug("zonos3-tts: dropping non-engine field %r", key)
+                continue
+            payload[key] = value
         for key, value in self._base_options.items():
+            if _ENGINE_FIELDS and key not in _ENGINE_FIELDS:
+                logger.debug("zonos3-tts: dropping non-engine request_option %r", key)
+                continue
             payload.setdefault(key, value)
         return payload
 
@@ -1307,8 +1458,26 @@ class Zonos3TTS(TTSProvider):
             logger.info("zonos3-tts: %d chars exceeds one engine take; speaking "
                         "%d chunks", len(text), len(pieces))
 
-        audio = _merge_wav([self._synthesize_one(piece, voice, speed, extra)
-                            for piece in pieces])
+        # Resolve the voice ONCE for the whole utterance. Each chunk otherwise
+        # re-resolves the id (a speakers round trip) and, for a clone, re-runs
+        # ffmpeg — which for a 5-chunk reply is 5 clip encodes for identical bytes.
+        speaker = None
+        clip_b64 = None
+        clip_voice = (voice or "").strip()
+        if clip_voice and Path(clip_voice).suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}:
+            if not self._sup.cloning_supported:
+                raise RuntimeError(
+                    "zonos3-tts: cloning from an audio clip needs zac-encoder.gguf and "
+                    "ssl-teacher.gguf in the model directory (see the README)")
+            clip_b64 = self._encode_clip(Path(clip_voice))
+        else:
+            speaker = self._sup.resolve_voice(voice)
+
+        audio = _merge_wav([
+            self._synthesize_one(piece, voice, speed, extra,
+                                 speaker=speaker, clip_b64=clip_b64)
+            for piece in pieces
+        ])
         out.write_bytes(audio)
         logger.info("zonos3-tts: %d bytes (peak %d) -> %s",
                     len(audio), wav_peak(audio), out)
@@ -1329,9 +1498,12 @@ class Zonos3TTS(TTSProvider):
         return 1400
 
     def _synthesize_one(self, text: str, voice: Optional[str],
-                        speed: Optional[float], extra: dict) -> bytes:
+                        speed: Optional[float], extra: dict,
+                        speaker: Optional[str] = None,
+                        clip_b64: Optional[str] = None) -> bytes:
         """One engine request, with the silent-WAV retry ladder."""
-        payload = self._payload(text, voice, speed, extra)
+        payload = self._payload(text, voice, speed, extra,
+                                speaker=speaker, clip_b64=clip_b64)
         # A first clone makes the engine encode the reference (measured ~6.6 s on
         # GPU, minutes on CPU), so it gets the load ceiling rather than the
         # ordinary request timeout — otherwise the very first cloned utterance
@@ -1489,6 +1661,8 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
         steer_hold=_float_setting(ctx, "steer_hold", _DEFAULT_STEER_HOLD),
         steer_onset=_float_setting(ctx, "steer_onset_seconds", _DEFAULT_STEER_ONSET),
         steer_ramp=_float_setting(ctx, "steer_ramp_seconds", _DEFAULT_STEER_RAMP),
+        headroom_db=(_float_setting(ctx, "headroom_db", -1.0)
+                     if _setting(ctx, "headroom_db", None) is not None else None),
     )
     ctx.register_tts_provider(provider)
 
