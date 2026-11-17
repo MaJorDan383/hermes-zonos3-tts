@@ -101,6 +101,21 @@ _DEFAULT_DYNAMIC_RANGE = 1.5     # pitch.pitch_range, safe band ±2
 _DEFAULT_EXPRESSIVE = 4.0        # expressive.expressive, safe band ±8
 _DEFAULT_VOLUME_BOOST = 2.0      # delivery.loud, safe band 0-4
 
+# Steer-then-hold. A constant hidden-space push integrates over a long line: the
+# model copies the style of speech it has already produced, so stacked liveliness
+# + valence + arousal climb in pitch and loudness towards shouting. Zyphra measured
+# a stacked voice design climbing in 19 of 24 takes with the push held constant,
+# and chose onset 4 s / ramp 1 s / hold 0.35 as the largest hold that stayed
+# neutral. Their numbers: hold 1.0 = +7.2 st and +7.0 dB after the first 5 s;
+# hold 0.35 = +0.6 st / +5.2 dB. We follow their default because our shipped
+# expressive 4 + pitch_range 1.5 are exactly the "stacked" case they warn about.
+# Only sent when the live bundle advertises `steer_release` — a `steer_hold` below
+# 1 without it is a 400.
+_DEFAULT_STEER_HOLD = 0.35
+_DEFAULT_STEER_ONSET = 4.0
+_DEFAULT_STEER_RAMP = 1.0
+_UNSET = object()
+
 # --------------------------------------------------------------------------- emotion
 
 # SenseVoice emotion labels -> ZONOS3 steering directions, verified against
@@ -317,6 +332,78 @@ def wav_is_silent(raw: bytes) -> bool:
 
 def wav_peak(raw: bytes) -> int:
     return max((abs(x) for x in _samples(raw)), default=0)
+
+
+def _split_for_engine(text: str, budget: int) -> list[str]:
+    """Split *text* into engine-sized pieces at sentence, then clause, boundaries.
+
+    The engine's generation cap is per request and it does not report hitting it,
+    so a long line is either spoken in full as several takes or silently cut. The
+    split prefers ``.!?`` followed by whitespace, falls back to ``,;:`` and then to
+    a hard cut on whitespace, so a piece never lands mid-word. Nothing is dropped:
+    the join of the pieces is the original text apart from collapsed spacing.
+    """
+    text = text.strip()
+    if len(text) <= budget:
+        return [text]
+
+    import re
+    # Ranked boundary patterns: sentence end, then clause, then any space.
+    boundaries = [r'(?<=[.!?])\s+', r'(?<=[,;:])\s+', r'\s+']
+    pieces: list[str] = []
+    rest = text
+    while len(rest) > budget:
+        head, tail = rest[:budget], rest[budget:]
+        cut = -1
+        for pattern in boundaries:
+            candidates = [m.start() for m in re.finditer(pattern, rest[:budget])]
+            if candidates:
+                cut = candidates[-1]
+                break
+        if cut <= 0:
+            cut = budget            # one gigantic token; nothing sane to split on
+        piece = rest[:cut].strip()
+        if piece:
+            pieces.append(piece)
+        rest = rest[cut:].lstrip()
+    if rest.strip():
+        pieces.append(rest.strip())
+    return pieces
+
+
+def _merge_wav(parts: list[bytes]) -> bytes:
+    """Concatenate WAV bodies into one WAV, keeping the first header's format.
+
+    Concatenating whole files would leave a 44-byte header mid-stream that a
+    player treats as audio (audible click, and the duration lies). Splicing only
+    the PCM data and rewriting the size fields produces one honest container.
+    """
+    if not parts:
+        return b""
+    if len(parts) == 1:
+        return parts[0]
+    import struct
+    first = parts[0]
+    if len(first) < 44 or first[:4] != b"RIFF":
+        return first
+    pcm = bytearray()
+    for part in parts:
+        # Walk to the data chunk rather than assuming 44 bytes: some encoders
+        # emit a LIST/INFO chunk before it.
+        if len(part) < 44 or part[:4] != b"RIFF":
+            continue
+        offset = 12
+        while offset + 8 <= len(part):
+            chunk_id = part[offset:offset + 4]
+            chunk_size = struct.unpack("<I", part[offset + 4:offset + 8])[0]
+            if chunk_id == b"data":
+                pcm += part[offset + 8: offset + 8 + chunk_size]
+                break
+            offset += 8 + chunk_size + (chunk_size & 1)
+    header = bytearray(first[:first.find(b"data") + 8])
+    struct.pack_into("<I", header, 4, 36 + len(pcm))
+    struct.pack_into("<I", header, len(header) - 4, len(pcm))
+    return bytes(header) + bytes(pcm)
 
 
 # --------------------------------------------------------------------------- engine
@@ -863,7 +950,10 @@ class Zonos3TTS(TTSProvider):
     def __init__(self, supervisor: EngineSupervisor, *, options: Optional[dict] = None,
                  emotion_aware: bool = True, language: str = "en_us",
                  dynamic_range: float = 0.0, expressive: float = 0.0,
-                 volume_boost: float = 0.0, streams_pcm: bool = False):
+                 volume_boost: float = 0.0, streams_pcm: bool = False,
+                 steer_hold: Optional[float] = None,
+                 steer_onset: Optional[float] = None,
+                 steer_ramp: Optional[float] = None):
         self._sup = supervisor
         self._base_options = dict(options or {})
         self._emotion_aware = emotion_aware
@@ -879,6 +969,13 @@ class Zonos3TTS(TTSProvider):
         self._dynamic_range = float(dynamic_range or 0.0)
         self._expressive = float(expressive or 0.0)
         self._volume_boost = float(volume_boost or 0.0)
+        # Steer-then-hold window. `steer_hold >= 1` means "constant push", which
+        # is the old behaviour and never needs the bundle's block.
+        self._steer_hold = float(steer_hold if steer_hold is not None else _DEFAULT_STEER_HOLD)
+        self._steer_onset = float(steer_onset if steer_onset is not None else _DEFAULT_STEER_ONSET)
+        self._steer_ramp = float(steer_ramp if steer_ramp is not None else _DEFAULT_STEER_RAMP)
+        self._steer_release: Any = _UNSET
+        self._max_frames: Optional[int] = None
         # Hermes only takes the raw-PCM path when this is true AND
         # stream_sample_rate is valid; the rate is read from the engine's own
         # X-Audio-Sample-Rate header at stream time, so this is just the opt-in.
@@ -993,6 +1090,41 @@ class Zonos3TTS(TTSProvider):
         except Exception:  # noqa: BLE001 - no bundle, or the server is down
             return False
 
+    def steering_release(self) -> Optional[dict]:
+        """The bundle's `steer_release` defaults, or None when it has no block.
+
+        Sending `steer_hold` below 1 to a server whose bundle lacks this block is
+        a 400, so the value has to be read from the live server rather than
+        assumed. Cached: the bundle cannot change without an engine restart.
+        """
+        if self._steer_release is not _UNSET:
+            return self._steer_release
+        found = None
+        try:
+            status, body = self._sup.client._request("/v2/controls", timeout=3.0)
+            if status == 200:
+                block = json.loads(body).get("steer_release")
+                if isinstance(block, dict) and block:
+                    found = block
+        except Exception:  # noqa: BLE001 - treat as absent
+            found = None
+        self._steer_release = found
+        return found
+
+    @property
+    def max_frames(self) -> int:
+        """The server's generation cap in codec frames (15 fps), cached."""
+        if self._max_frames is None:
+            frames = 0
+            try:
+                status, body = self._sup.client._request("/v2/capabilities", timeout=3.0)
+                if status == 200:
+                    frames = int(json.loads(body).get("max_tokens") or 0)
+            except Exception:  # noqa: BLE001
+                frames = 0
+            self._max_frames = frames
+        return self._max_frames
+
     # -- request ----------------------------------------------------------
     @staticmethod
     def _encode_clip(path: Path, max_seconds: int = 30) -> str:
@@ -1101,6 +1233,14 @@ class Zonos3TTS(TTSProvider):
                 controls.setdefault(key, value)
         if controls:
             payload["controls"] = controls
+            # Steer-then-hold: only meaningful when something is actually being
+            # steered, and only sendable when the bundle advertises the block.
+            # Without it, `steer_hold < 1` is a hard 400, so the capability is
+            # read from the live server rather than assumed from the docs.
+            if 0.0 <= self._steer_hold < 1.0 and self.steering_release():
+                payload.setdefault("steer_hold", round(self._steer_hold, 3))
+                payload.setdefault("steer_onset_seconds", round(self._steer_onset, 2))
+                payload.setdefault("steer_ramp_seconds", round(self._steer_ramp, 2))
 
         # Pass through engine request fields (seed, temperature, guidance_scale,
         # accent, condition_values, …). The engine rejects unknown keys with a
@@ -1153,6 +1293,44 @@ class Zonos3TTS(TTSProvider):
                    format: str = "mp3", **extra: Any) -> str:
         if not text or not text.strip():
             raise ValueError("zonos3-tts: text is required")
+        out = Path(output_path).with_suffix(".wav")
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        # The engine caps generation at max_tokens frames (2000 on this release,
+        # 15 fps => ~133 s) and does NOT report hitting it: at 522+ words the
+        # returned WAV simply stops, and past ~750 words the server RESETS the
+        # connection and dies. Both measured. So long text is split at sentence
+        # boundaries and concatenated — every second the caller asked for is
+        # spoken, one cold engine start, and no crash.
+        pieces = _split_for_engine(text, self._char_budget())
+        if len(pieces) > 1:
+            logger.info("zonos3-tts: %d chars exceeds one engine take; speaking "
+                        "%d chunks", len(text), len(pieces))
+
+        audio = _merge_wav([self._synthesize_one(piece, voice, speed, extra)
+                            for piece in pieces])
+        out.write_bytes(audio)
+        logger.info("zonos3-tts: %d bytes (peak %d) -> %s",
+                    len(audio), wav_peak(audio), out)
+        return str(out)
+
+    def _char_budget(self) -> int:
+        """Characters that safely fit one engine take.
+
+        Derived from the measured cap rather than guessed: the engine stops at
+        2000 frames (133 s) and crashes a few hundred words past that. Speech runs
+        ~14 characters per second at this voice's rate, so 110 s of headroom is
+        ~1540 chars; the floor keeps a small cap from producing one-word chunks.
+        """
+        frames = self.max_frames
+        if frames and frames > 0:
+            seconds = (frames / 15.0) * 0.82   # 18% headroom under the hard stop
+            return max(200, int(seconds * 14))
+        return 1400
+
+    def _synthesize_one(self, text: str, voice: Optional[str],
+                        speed: Optional[float], extra: dict) -> bytes:
+        """One engine request, with the silent-WAV retry ladder."""
         payload = self._payload(text, voice, speed, extra)
         # A first clone makes the engine encode the reference (measured ~6.6 s on
         # GPU, minutes on CPU), so it gets the load ceiling rather than the
@@ -1199,13 +1377,8 @@ class Zonos3TTS(TTSProvider):
             raise RuntimeError(
                 f"ZONOS3-Mini returned silent audio after {attempts} attempts")
 
-        out = Path(output_path).with_suffix(".wav")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(audio)
         self._sup.mark_warm()
-        logger.info("zonos3-tts: %d bytes (peak %d) -> %s",
-                    len(audio), wav_peak(audio), out)
-        return str(out)
+        return audio
 
 
 # --------------------------------------------------------------------------- settings
@@ -1313,6 +1486,9 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
         expressive=_float_setting(ctx, "expressive", _DEFAULT_EXPRESSIVE),
         volume_boost=_float_setting(ctx, "volume_boost", _DEFAULT_VOLUME_BOOST),
         streams_pcm=_bool_setting(ctx, "streaming", True),
+        steer_hold=_float_setting(ctx, "steer_hold", _DEFAULT_STEER_HOLD),
+        steer_onset=_float_setting(ctx, "steer_onset_seconds", _DEFAULT_STEER_ONSET),
+        steer_ramp=_float_setting(ctx, "steer_ramp_seconds", _DEFAULT_STEER_RAMP),
     )
     ctx.register_tts_provider(provider)
 

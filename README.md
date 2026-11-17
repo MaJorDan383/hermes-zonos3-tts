@@ -109,6 +109,9 @@ hermes config set plugins.entries.zonos3-tts.settings.unload_after_seconds 300
 | `expressive` | `4.0` | `expressive.expressive` — liveliness. Safe band ±8 |
 | `volume_boost` | `2.0` | `delivery.loud` — the engine's only real gain. Safe band 0–4; 4 is clearly louder |
 | `streaming` | `true` | Opt into Hermes' raw-PCM streaming path (native 44100 Hz, float32→int16 in the client) |
+| `steer_hold` | `0.35` | Steer-then-hold: dose multiplier after the onset. `1` = constant push (old behaviour). **Only sent when the live bundle advertises `steer_release`** |
+| `steer_onset_seconds` | `4.0` | Seconds at full dose before the ramp begins |
+| `steer_ramp_seconds` | `1.0` | Linear ramp length from full dose to `steer_hold` |
 
 Every setting except the ones read once at `register()` is re-read live, so a
 status-chip change applies on the next release without restarting Hermes.
@@ -410,6 +413,49 @@ automatically for bundled voices; a reference-clip voice skips the range control
 Still useful if you ever want it back: the engine attenuates by
 `headroom_db: 3` on every request, so `request_options: {"headroom_db": 0}`
 recovers that 3 dB for free with no post-processing.
+
+### Long text: chunked, because the engine truncates and then crashes
+
+The engine caps generation at `max_tokens` frames — 2000 on this release at 15 fps,
+so **~133 s per request** — and it does **not** report hitting the cap. Measured on
+this host:
+
+| Words | Result |
+|---|---|
+| 116–464 | under the cap, spoken in full |
+| 522–638 | **132.7 s returned** — silently truncated at the cap |
+| 754+ | **connection reset, engine process died** |
+
+So `synthesize()` splits text at sentence boundaries (then `,;:`, then whitespace)
+against a character budget derived from the live `max_tokens`, speaks each piece,
+and splices the PCM into one WAV with rewritten sizes. Nothing is dropped and the
+header stays honest. Before this, a long reply was either cut short or killed the
+engine mid-session.
+
+### Steer then hold: withheld on bundles that lack the block
+
+Zyphra's guide documents `steer_release` (`{onset_seconds, ramp_seconds, hold,
+exempt}`): request-level hidden `controls` run at full dose for `onset_seconds`,
+ramp linearly to `hold × dose`, then stay. A constant push integrates over a long
+line — the model copies the style of speech it already produced — so stacked
+liveliness + valence + arousal climb towards shouting. Their measurement: a stacked
+voice design held constant climbed in **19 of 24 takes** (+7.2 st, +7.0 dB), while
+hold 0.35 gave +0.6 st / +5.2 dB with neutral's climb count.
+
+That is exactly the risk of this plugin's defaults (`expressive 4` + `pitch_range
+1.5` are a stacked design), so the settings exist — `steer_hold`,
+`steer_onset_seconds`, `steer_ramp_seconds`, defaulting to 0.35 / 4 / 1.
+
+**But this bundle predates the block:** `GET /v2/capabilities` and `/v2/controls`
+both report `steer_release: null`, and `steer_hold < 1` without it is a hard 400. So
+the plugin sends the fields **only when the live server advertises the block**, and
+keeps the constant-push behaviour otherwise. When you update `steer.gguf` to a
+bundle that carries `steer_release`, the hold engages with no config change.
+
+Two related doc features are **unavailable here**, both capability-gated:
+reading-position span steering needs `laci_languages` (this build reports `[]`), and
+`control_spans` editorial emphasis needs that too. Check `GET /v2/capabilities`
+before assuming either.
 
 ### Streaming: native rate, no resampling
 
