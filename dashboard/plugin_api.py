@@ -46,10 +46,34 @@ def _state_path() -> Path:
 
 
 def _read_state() -> Dict[str, Any]:
-    try:
-        return json.loads(_state_path().read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    """Newest valid snapshot from the per-writer state files.
+
+    More than one process can host this plugin (the gateway serves read-aloud, the
+    dashboard serves the chip's routes), and each constructs its own supervisor
+    and publishes its own snapshot. A single shared file then flickers: whichever
+    process wrote last wins, so a stale instance can overwrite a fresh one and the
+    chip reports "no streaming" for a provider that is streaming.
+
+    So each writer publishes to `_engine_state.<pid>.json` and this reader returns
+    the freshest snapshot, ignoring fossils. The legacy unsuffixed file is still
+    read so an older writer keeps working.
+    """
+    folder = _state_path().parent
+    best: Dict[str, Any] = {}
+    best_at = -1.0
+    candidates = sorted(folder.glob("_engine_state*.json"))
+    for path in candidates:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        try:
+            at = float(state.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if at > best_at:
+            best, best_at = state, at
+    return best
 
 
 def _pid_alive(pid: Any) -> bool:

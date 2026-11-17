@@ -1675,10 +1675,21 @@ class _StatePublisher:
                 "updated_at": time.time(),
                 "agent_pid": os.getpid(),
             }
-            target = out_dir / "_engine_state.json"
+            target = out_dir / f"_engine_state.{os.getpid()}.json"
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(payload), encoding="utf-8")
             os.replace(tmp, target)
+            # Also refresh the unsuffixed file so an older reader (a dashboard
+            # process started before this change) sees fresh data instead of a
+            # fossil. Two writers collide here, which is exactly why the reader
+            # prefers the per-pid files.
+            legacy = out_dir / "_engine_state.json"
+            try:
+                legacy_tmp = legacy.with_suffix(".json.tmp")
+                legacy_tmp.write_text(json.dumps(payload), encoding="utf-8")
+                os.replace(legacy_tmp, legacy)
+            except Exception:  # noqa: BLE001 - the per-pid file is authoritative
+                pass
         except Exception as exc:  # noqa: BLE001 - telemetry only
             logger.debug("zonos3-tts: could not publish state: %s", exc)
 
