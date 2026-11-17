@@ -58,11 +58,14 @@ except Exception:  # noqa: BLE001
 
 try:  # pragma: no cover - import plumbing
     from .sensevoice import SenseVoiceEmotion
+    from . import sensevoice as sensevoice_mod
 except Exception:  # noqa: BLE001
     try:
         from sensevoice import SenseVoiceEmotion  # type: ignore[no-redef]
+        import sensevoice as sensevoice_mod      # type: ignore[no-redef]
     except Exception:  # noqa: BLE001
         SenseVoiceEmotion = None               # type: ignore[assignment]
+        sensevoice_mod = None                  # type: ignore[assignment]
 
 try:  # pragma: no cover - import plumbing
     from .ducking import AudioDucker
@@ -1322,6 +1325,7 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
     # -- emotion pipeline --------------------------------------------------
     # Registered before the publisher so the state file can report it.
     pipeline = None
+    detector = None
     if SenseVoiceEmotion is not None and emotion_mod is not None:
         try:
             configured_dir = str(_setting(ctx, "sensevoice_model_dir", "")
@@ -1329,6 +1333,8 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
             detector = SenseVoiceEmotion(
                 Path(configured_dir) if configured_dir else None,
                 enabled=_bool_setting(ctx, "emotion_stt", True),
+                engine=str(_setting(ctx, "sensevoice_engine", "onnx") or "onnx"),
+                threads=int(_setting(ctx, "sensevoice_threads", 2) or 2),
             )
             pipeline = EmotionPipeline(
                 detector, provider,
@@ -1356,6 +1362,30 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
                         state, _bool_setting(ctx, "emotion_auto", True))
         except Exception as exc:  # noqa: BLE001 - voice still works without affect
             logger.warning("zonos3-tts: emotion pipeline unavailable: %s", exc)
+
+    # -- SenseVoice as the STT provider ------------------------------------
+    # Optional, and off by default: the host may already be pointed at another
+    # provider (local whisper, a cloud API, …). Turning this on makes one
+    # SenseVoice pass produce the transcript *and* the affect, so the emotion
+    # hook does not have to decode the same audio a second time.
+    stt_provider = None
+    if detector is not None and _bool_setting(ctx, "stt_enabled", False):
+        try:
+            stt_provider = sensevoice_mod.make_stt_provider(
+                detector,
+                on_result=(pipeline.observe_result if pipeline is not None else None),
+                display_name="SenseVoice (local)",
+            )
+            ctx.register_transcription_provider(stt_provider)
+            logger.info("zonos3-tts: sensevoice STT provider registered (engine=%s)",
+                        detector.engine)
+        except Exception as exc:  # noqa: BLE001 - TTS must still work
+            logger.warning("zonos3-tts: could not register the sensevoice STT provider: %s", exc)
+            stt_provider = None
+    try:
+        ctx._zonos3_stt = stt_provider
+    except Exception:  # noqa: BLE001
+        pass
 
     # -- audio ducking -----------------------------------------------------
     # Registered before the publisher so the state file can report it.
@@ -1593,12 +1623,24 @@ class EmotionPipeline:
         """
         if not self.enabled or not getattr(self.detector, "is_available", lambda: False)():
             return {"ok": False, "reason": "sensevoice unavailable"}
-        result = self.detector.recognise(audio_path)
-        if not result.ok:
-            return {"ok": False, "reason": result.error}
+        return self.observe_result(self.detector.recognise(audio_path))
+
+    def observe_result(self, result) -> dict:
+        """Accept an already-computed :class:`EmotionResult`.
+
+        The ``sensevoice`` STT provider transcribes with the same detector, so
+        when it is the active provider the affect has *already* been recognised
+        by the time the transcript exists. Re-running the model here would be a
+        second full decode of the same audio for no new information, so the
+        provider hands its result straight to this method instead.
+        """
+        if not self.enabled:
+            return {"ok": False, "reason": "emotion pipeline disabled"}
+        if not getattr(result, "ok", False):
+            return {"ok": False, "reason": getattr(result, "error", "recognition failed")}
         with self._lock:
             self._emotion = result.emotion
-            self._intensity = result.intensity
+            self._intensity = result.intensity if result.intensity is not None else 0.0
             self._events = list(result.events)
             self._at = time.time()
             self._turn_consumed = False
@@ -1617,14 +1659,28 @@ class EmotionPipeline:
         else:
             self.provider.clear_emotion()
 
+    def _stt_provider_selected(self) -> bool:
+        """True when ``stt.provider`` is this plugin's own ``sensevoice`` provider.
+
+        Read from the host config on every call (it is a dict lookup on an already
+        parsed config), so switching providers takes effect on the next turn
+        instead of only after a restart. Any failure reads as "not selected",
+        which falls back to the hook doing its own decode — the safe default.
+        """
+        try:
+            from tools.transcription_tools import _load_stt_config, _get_provider
+            return str(_get_provider(_load_stt_config()) or "").strip().lower() == "sensevoice"
+        except Exception:  # noqa: BLE001 - host internals, fail open
+            return False
+
     # -- LLM side ---------------------------------------------------------
     def on_pre_transcription(self, **kwargs) -> Optional[dict]:
         """``pre_transcription`` hook: analyse the recorded audio for affect.
 
         This is what makes emotion automatic. The hook fires before any STT
         backend runs, so it sees the exact file that will be transcribed — no
-        Voxta involvement, no patched host call site, and it works for the
-        desktop mic, CLI voice mode and the gateway alike.
+        extra service in the loop, no patched host call site, and it works for
+        the desktop mic, CLI voice mode and the gateway alike.
 
         Returns ``None`` deliberately: this hook exists to *observe*, and the
         configured STT provider still produces the transcript the user reads.
@@ -1638,6 +1694,15 @@ class EmotionPipeline:
         merely "this turn had no affect tag", never a broken turn.
         """
         if not self.enabled or not self.auto:
+            return None
+        # When the sensevoice STT provider is the *configured* provider it has
+        # already recognised this exact file (transcript *and* affect) and
+        # reported through observe_result, so decoding it again here would
+        # double the CPU for the same answer. Checked live rather than latched at
+        # registration: merely registering the provider while `stt.provider`
+        # still names something else must keep this hook working, or the emotion
+        # feature would silently stop the moment the provider was enabled.
+        if self._stt_provider_selected():
             return None
         file_path = kwargs.get("file_path")
         if not file_path:

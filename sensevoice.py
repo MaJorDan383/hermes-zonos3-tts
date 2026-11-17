@@ -1,46 +1,60 @@
-"""SenseVoice-small emotion recognition for the ZONOS3 voice loop.
+"""SenseVoice-small speech recognition for the ZONOS3 voice loop.
 
 Runs the **int8 ONNX export already on this machine** (``~/.dsh/speech-to-text/
-sensevoice/models/sensevoice-onnx``), so the emotion feature costs no extra
-disk: the weights are shared with the copy that is already installed. Nothing is
-downloaded, and the 893 MB PyTorch checkpoint in Voxta's model folder is *not*
-used — that one needs torch + funasr at runtime, neither of which is needed here.
+sensevoice/models/sensevoice-onnx``), so nothing is downloaded and no PyTorch
+checkpoint is loaded. Two backends drive the same two files
+(``model.int8.onnx`` + ``tokens.txt``):
 
-Why the ONNX path works with what Hermes already bundles
---------------------------------------------------------
-SenseVoice-small is a FunASR SAN-M encoder with a CTC head. The exported ONNX
-takes the raw 560-dim feature frames (80 mel x LFR 7/6) directly, so no
-``kaldi_native_fbank`` is required: the frontend is reproduced in NumPy below.
-``onnxruntime`` is already a Hermes dependency, so ``pip_dependencies`` stays
-empty.
+``onnx`` (default)
+    A bare ``onnxruntime`` session plus the Kaldi-style frontend reproduced in
+    NumPy below (80 mel, LFR 7/6). No extra dependency at all — ``onnxruntime``
+    is already a Hermes dependency — and it is the only backend that exposes the
+    CTC **posteriors**, i.e. the margin-based ``intensity`` dial. Measured
+    end-to-end here (decode + infer): 354 ms for a 3 s clip, 537 ms for 5 s.
 
-The emotion is not a separate classifier. SenseVoice emits **control tokens**
-inside its own CTC output — ``<|HAPPY|>``, ``<|SAD|>``, ``<|ANGRY|>``,
-``<|NEUTRAL|>``, ``<|FEARFUL|>``, ``<|DISGUSTED|>``, ``<|SURPRISED|>``,
-``<|EMO_UNKNOWN|>`` — plus audio-event tags (``<|Speech|>``, ``<|Laughter|>``,
-``<|Applause|>``, ``<|Cry|>``, ``<|Cough|>`` …). They live in the last ~170 rows
-of ``tokens.txt``. So one forward pass yields transcript *and* affect, which is
-why this is cheap: no second model, no extra GPU memory.
+``sherpa``
+    sherpa-onnx, a small C++ runtime with the SenseVoice CTC frontend built in
+    (``pip install sherpa-onnx``, 28 MB, CPU only). Its feature extractor, thread
+    pool and CTC collapse are native, which made it ~3x faster on *inference
+    alone* (105 ms vs 414 ms for a 3 s clip); once audio decoding and process
+    overhead are included the two engines measure the same, so it is opt-in. It
+    reports the emotion label but not the posteriors, so no ``intensity``.
 
-Emotional intensity is approximated from the CTC **posterior margin** on the
-winning emotion token: a confident emotion token (a clean peak in the
-distribution) reads as a strongly expressed feeling, a marginal one as a mild
-cast. That is a heuristic, not a calibrated score, and the docstring on
-:func:`recognise` says so.
+Both backends emit the same :class:`EmotionResult`.
+
+Why this needs no tokenizer
+---------------------------
+SenseVoice-small is a FunASR SAN-M encoder with a CTC head. The emotion is not a
+separate classifier: the model emits **control tokens** inside its own CTC
+output — ``<|HAPPY|>``, ``<|SAD|>``, ``<|ANGRY|>``, ``<|NEUTRAL|>``,
+``<|FEARFUL|>``, ``<|DISGUSTED|>``, ``<|SURPRISED|>``, ``<|EMO_UNKNOWN|>`` — plus
+audio-event tags (``<|Speech|>``, ``<|Laughter|>``, ``<|Applause|>``, ``<|Cry|>``,
+``<|Cough|>`` …). They live in the last ~170 rows of ``tokens.txt``. So one
+forward pass yields transcript *and* affect: no second model, no extra VRAM.
+
+``text_norm`` is a token id, not a flag
+---------------------------------------
+The exported graph takes ``language`` and ``text_norm`` as **int32 token ids**
+resolved through an embedding table, not booleans. ``text_norm`` must be the id
+of ``<|withitn|>`` (14 in this vocabulary) to get inverse text normalisation —
+digits, punctuation, capitalisation. The obvious-looking ``1`` selects
+``<|woitn|>``, which strips all of that: it returns ``fifty pieces of code``
+instead of ``50 pieces of code.``, and drops the sentence-final period in CJK.
+Out-of-range values crash inside the graph's Gather (e.g. 16).
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import os
 import shutil
 import subprocess
 import tempfile
 import threading
+import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -56,14 +70,26 @@ LFR_M, LFR_N = 7, 6
 # copy: the point of using this build is to avoid a second 231 MB model on disk.
 DEFAULT_MODEL_DIR = Path.home() / ".dsh" / "speech-to-text" / "sensevoice" / "models" / "sensevoice-onnx"
 
+# `<|withitn|>` in this vocabulary (see module docstring): inverse text
+# normalisation on. `<|woitn|>` is 1 and silently strips all punctuation/digits.
+TEXT_NORM_ON = 14
+
+# SenseVoice language ids for the `language` input. 0 is auto-detect, which is
+# what every caller gets unless it passes an explicit hint.
+_LANG_IDS = {"auto": 0, "zh": 1, "en": 2, "ja": 3, "ko": 4, "yue": 5}
+
 # SenseVoice emotion labels -> the vocabulary this plugin maps onto ZONOS3.
 _EMOTIONS = ("NEUTRAL", "HAPPY", "SAD", "ANGRY", "FEARFUL", "DISGUSTED", "SURPRISED")
 _AUDIO_EVENTS = ("Speech", "BGM", "Laughter", "Applause", "Cry", "Sneeze",
                  "Breath", "Cough", "Speech_Noise", "Event_UNK")
 
-# CTC blank for the exported model. The blank id is the last vocabulary index;
-# tokens.txt omits it, so it is derived from the vocab size.
-_BLANK_FALLBACK = 0
+# Short alpha control tokens that are normalisation hints, not language tags.
+_NON_LANGUAGE_TAGS = {"woitn", "withitn"}
+
+# Decoding threads. Measured on this host (i7-12700K, 12C/20T, int8 ONNX): 2
+# threads is the sweet spot — a 3 s clip in 414 ms vs 1028 ms at 1 thread and
+# 867 ms at 4. More threads oversubscribe the P/E split and lose badly.
+DEFAULT_THREADS = 2
 
 
 @dataclass
@@ -72,7 +98,9 @@ class EmotionResult:
 
     text: str = ""
     emotion: str = "neutral"
-    intensity: float = 0.0
+    # None when the active backend cannot measure it: sherpa reports the label
+    # only, while the onnxruntime backend exposes the CTC posteriors behind it.
+    intensity: Optional[float] = None
     events: list[str] = field(default_factory=list)
     language: str = ""
     raw_tokens: list[str] = field(default_factory=list)
@@ -86,11 +114,15 @@ class EmotionResult:
         """Compact tag for the model, e.g. ``[voice: emotion=angry intensity=0.8 events=cry]``.
 
         Deliberately terse and machine-shaped: it rides inside the user turn, so
-        every token spent here is one the user's own words do not get.
+        every token spent here is one the user's own words do not get. Intensity
+        is omitted when the backend did not measure it, rather than printing a
+        number it does not have.
         """
         if not self.ok or self.emotion in ("neutral", "unknown", ""):
             return ""
-        parts = [f"emotion={self.emotion}", f"intensity={self.intensity:.1f}"]
+        parts = [f"emotion={self.emotion}"]
+        if self.intensity is not None:
+            parts.append(f"intensity={self.intensity:.1f}")
         if self.events:
             parts.append("events=" + ",".join(self.events))
         return "[voice: " + " ".join(parts) + "]"
@@ -133,13 +165,13 @@ def _fbank(x):
     n_frames = 1 + (len(x) - frame_len) // shift
     window = np.hamming(frame_len)
     fb = _mel_filterbank()
-    out = np.empty((n_frames, N_MELS), dtype=np.float32)
-    for i in range(n_frames):
-        frame = x[i * shift: i * shift + frame_len] * window
-        spec = np.fft.rfft(frame, N_FFT)
-        power = (spec.real ** 2 + spec.imag ** 2).astype(np.float32)
-        out[i] = np.log(power @ fb.T + 1e-10)
-    return out
+    # Frame the whole signal once, then one batched FFT instead of a Python loop
+    # over frames: identical output, far cheaper on longer clips.
+    idx = np.arange(frame_len)[None, :] + shift * np.arange(n_frames)[:, None]
+    frames = x[idx] * window
+    spec = np.fft.rfft(frames, N_FFT, axis=1)
+    power = (spec.real ** 2 + spec.imag ** 2).astype(np.float32)
+    return np.log(power @ fb.T + 1e-10)
 
 
 def _apply_lfr(feat, m: int = LFR_M, n: int = LFR_N):
@@ -152,199 +184,242 @@ def _apply_lfr(feat, m: int = LFR_M, n: int = LFR_N):
     return out.reshape(len(starts), m * feat.shape[1])
 
 
-# --------------------------------------------------------------------------- engine
+# --------------------------------------------------------------------------- audio
 
 
-class SenseVoiceEmotion:
-    """Lazy-loaded SenseVoice recogniser that returns transcript + emotion.
+_FFMPEG_CACHE: list[Optional[str]] = []
 
-    One ONNX session, created on first use and reused. The session is
-    CPU-only and int8-quantised, so it neither competes with ZONOS3 for VRAM nor
-    keeps the GPU busy between utterances; a short clip transcribes in well under
-    a second (measured ~0.3 s for 7 s of audio on this host).
+
+def _find_ffmpeg() -> Optional[str]:
+    """Resolve ffmpeg once per process.
+
+    ``shutil.which`` walks 679 PATH entries here (~216 ms), so the answer is
+    memoised: the binary cannot move between two utterances in the same session,
+    and a first call that found nothing is not retried on the next turn (which
+    keeps a missing-ffmpeg deployment failing fast instead of stalling).
     """
+    if _FFMPEG_CACHE:
+        return _FFMPEG_CACHE[0]
+    found = None
+    try:
+        from tools.transcription_audio import _find_ffmpeg_binary
+        found = _find_ffmpeg_binary()
+    except Exception:  # noqa: BLE001 - host helper is a convenience only
+        found = None
+    if not found:
+        found = shutil.which("ffmpeg")
+    _FFMPEG_CACHE.append(found)
+    return found
 
-    def __init__(self, model_dir: Optional[Path] = None, *, enabled: bool = True,
-                 ffmpeg: Optional[str] = None):
-        self.model_dir = Path(model_dir or os.environ.get("SENSEVOICE_ONNX_DIR")
-                              or DEFAULT_MODEL_DIR)
-        self.enabled = enabled
-        self._ffmpeg = ffmpeg
-        self._session = None
-        self._vocab: dict[int, str] = {}
-        self._lock = threading.Lock()
-        self.last_error = ""
 
-    # -- paths ------------------------------------------------------------
-    @property
-    def model_path(self) -> Path:
-        return self.model_dir / "model.int8.onnx"
+def load_audio(path: Path, ffmpeg: Optional[str] = None):
+    """``(16000, float32 mono samples)`` for *path*.
 
-    @property
-    def tokens_path(self) -> Path:
-        return self.model_dir / "tokens.txt"
+    A mono 16-bit **16 kHz** WAV is read directly — that is what the host's own
+    recorder produces (``voice_mode`` writes 16 kHz mono s16 WAV), and it costs
+    ~0.3 ms. Anything else (mp3/ogg/webm, 24-bit, 44.1/48 kHz, stereo) goes
+    through ffmpeg so both backends see identical 16 kHz input; a WAV at another
+    rate is *not* passed through, because the ORT graph is fixed at 16 kHz and
+    sherpa's own resampler would give the two engines slightly different
+    features (and logs a banner to stderr on every call).
 
-    def is_available(self) -> bool:
-        """Cheap presence check: no network, no session creation."""
-        if not self.enabled:
-            return False
-        try:
-            import onnxruntime  # noqa: F401
-        except Exception:  # noqa: BLE001
-            return False
-        return self.model_path.is_file() and self.tokens_path.is_file()
-
-    # -- vocab / session --------------------------------------------------
-    def _load_vocab(self) -> dict[int, str]:
-        if self._vocab:
-            return self._vocab
-        vocab: dict[int, str] = {}
-        for line in self.tokens_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            token, _, idx = line.rpartition(" ")
-            if token and idx.lstrip("-").isdigit():
-                vocab[int(idx)] = token
-        self._vocab = vocab
-        return vocab
-
-    def _get_session(self):
-        if self._session is not None:
-            return self._session
-        with self._lock:
-            if self._session is not None:
-                return self._session
-            import onnxruntime as ort
-            opts = ort.SessionOptions()
-            # One thread per call: utterances are short and arrive serially, and
-            # a wide pool would steal cores from the ZONOS3 backbone.
-            opts.intra_op_num_threads = max(1, min(4, (os.cpu_count() or 2) // 2))
-            self._session = ort.InferenceSession(
-                str(self.model_path), sess_options=opts,
-                providers=["CPUExecutionProvider"])
-        return self._session
-
-    # -- audio ------------------------------------------------------------
-    def _find_ffmpeg(self) -> Optional[str]:
-        if self._ffmpeg:
-            return self._ffmpeg
-        try:
-            from tools.transcription_audio import _find_ffmpeg_binary
-            found = _find_ffmpeg_binary()
-            if found:
-                self._ffmpeg = found
-                return found
-        except Exception:  # noqa: BLE001 - host helper is a convenience only
-            pass
-        self._ffmpeg = shutil.which("ffmpeg")
-        return self._ffmpeg
-
-    def _decode_wav(self, path: Path):
-        """16 kHz mono float32 samples via ffmpeg (handles any container)."""
-        import numpy as np
-        ffmpeg = self._find_ffmpeg()
-        if not ffmpeg:
-            raise RuntimeError("ffmpeg not found; SenseVoice needs it to decode audio")
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "sv16k.wav"
-            proc = subprocess.run(
-                [ffmpeg, "-v", "error", "-y", "-i", str(path),
-                 "-ac", "1", "-ar", str(SR), "-c:a", "pcm_s16le", str(out)],
-                capture_output=True, text=True, timeout=120,
-                stdin=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
-            if proc.returncode != 0 or not out.is_file():
-                raise RuntimeError(f"ffmpeg could not decode {path.name}: {proc.stderr[:200]}")
-            import wave
-            with wave.open(str(out), "rb") as w:
+    ffmpeg is resolved *after* the fast path, on purpose: ``shutil.which`` here
+    walks 679 PATH entries (~216 ms measured) and would otherwise be paid on
+    every single utterance in the common case that never needs it.
+    """
+    import numpy as np
+    try:
+        with wave.open(str(path), "rb") as w:
+            if (w.getnchannels() == 1 and w.getsampwidth() == 2
+                    and w.getframerate() == SR):
                 raw = w.readframes(w.getnframes())
-        return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+                return SR, np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    except (wave.Error, EOFError, OSError):
+        pass  # not a PCM wav: fall through to ffmpeg
 
-    # -- inference --------------------------------------------------------
-    def recognise(self, audio_path: str | Path, *, language: int = 0,
-                  text_norm: int = 1) -> EmotionResult:
-        """Transcribe and detect the speaker's emotion in one pass.
+    ffmpeg = ffmpeg or _find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found; SenseVoice needs it to decode this audio")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "sv16k.wav"
+        proc = subprocess.run(
+            [ffmpeg, "-v", "error", "-y", "-i", str(path),
+             "-ac", "1", "-ar", str(SR), "-c:a", "pcm_s16le", str(out)],
+            capture_output=True, text=True, timeout=120,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+        if proc.returncode != 0 or not out.is_file():
+            raise RuntimeError(f"ffmpeg could not decode {path.name}: {proc.stderr[:200]}")
+        with wave.open(str(out), "rb") as w:
+            raw = w.readframes(w.getnframes())
+    return SR, np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
 
-        ``intensity`` is a heuristic in ``0..1`` derived from how decisively the
-        CTC head picked the emotion token (softmax margin over the runner-up at
-        the frames where that token won). It is a useful ordering — clearly
-        emotional speech scores higher than flat speech — but it is not a
-        calibrated annotation, so downstream code treats it as a dial, not a
-        measurement.
-        """
-        if not self.is_available():
-            return EmotionResult(error="SenseVoice ONNX model or onnxruntime unavailable")
-        try:
-            import numpy as np
-            samples = self._decode_wav(Path(audio_path))
-            if samples.size == 0:
-                return EmotionResult(error="audio decoded to zero samples")
-            feat = _apply_lfr(_fbank(samples))
-            session = self._get_session()
-            logits = session.run(None, {
+
+# --------------------------------------------------------------------------- token parsing
+
+
+def _load_vocab(tokens_path: Path) -> dict[int, str]:
+    vocab: dict[int, str] = {}
+    for line in tokens_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        token, _, idx = line.rpartition(" ")
+        if token and idx.lstrip("-").isdigit():
+            vocab[int(idx)] = token
+    return vocab
+
+
+def _is_control(token: str) -> bool:
+    return token.startswith("<|") and token.endswith("|>")
+
+
+def _clean_tag(tag: str) -> str:
+    """``<|NEUTRAL|>`` -> ``NEUTRAL``; anything malformed -> ``""``."""
+    tag = (tag or "").strip()
+    return tag[2:-2] if _is_control(tag) else ""
+
+
+def _result_from_tokens(text: str, *, emotion: str = "", event: str = "", language: str = "",
+                        intensity: Optional[float] = None,
+                        raw_tokens: Optional[list[str]] = None) -> EmotionResult:
+    """Assemble an :class:`EmotionResult` from raw CTC tokens or sherpa's parsed fields.
+
+    Shared by both backends so the label mapping is written once: sherpa hands
+    over already-split ``emotion``/``event``/``lang``, while the onnxruntime path
+    only has *raw_tokens* and this has to pull the control tokens out of them.
+    """
+    events: list[str] = []
+    lang = language if language in _LANG_IDS and language != "auto" else ""
+    emo = emotion.lower() if emotion else ""
+
+    def take(name: str) -> None:
+        nonlocal emo, lang
+        if name in _EMOTIONS:
+            if not emo:
+                emo = name.lower()
+        elif name in _AUDIO_EVENTS:
+            if name.lower() not in {e.lower() for e in events}:
+                events.append(name)
+        elif len(name) <= 6 and name.isalpha() and name not in _NON_LANGUAGE_TAGS:
+            if not lang:
+                lang = name
+
+    if event:
+        take(event)
+    for tok in (raw_tokens or []):
+        if _is_control(tok):
+            take(tok[2:-2])
+
+    # SentencePiece marks word starts with "▁"; a joiner is what human-facing
+    # text wants in every language this model covers.
+    cleaned = (text or "").replace("▁", " ").strip()
+    # EMO_UNKNOWN is the model declining to name an affect, not a distinct one:
+    # report it as neutral so `emotion_mod.normalise` does not have to guess and
+    # so callers never carry a label the prosody table has no entry for.
+    if emo == "emo_unknown":
+        emo = ""
+    return EmotionResult(text=cleaned, emotion=emo or "neutral", intensity=intensity,
+                         events=events, language=lang, raw_tokens=list(raw_tokens or []))
+
+
+# --------------------------------------------------------------------------- backends
+
+
+class _SherpaBackend:
+    """sherpa-onnx SenseVoice recogniser — native frontend, fastest path."""
+
+    name = "sherpa"
+
+    def __init__(self, model_path: Path, tokens_path: Path, *, threads: int = DEFAULT_THREADS,
+                 use_itn: bool = True):
+        import sherpa_onnx
+        self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=str(model_path), tokens=str(tokens_path),
+            num_threads=max(1, int(threads)), use_itn=bool(use_itn),
+            debug=False, language="auto")
+        self._lock = threading.Lock()
+
+    def recognise(self, path: Path, *, language: int = 0, ffmpeg: Optional[str] = None) -> EmotionResult:
+        rate, samples = load_audio(path, ffmpeg)
+        with self._lock:  # one recognizer, one utterance at a time
+            stream = self._rec.create_stream()
+            stream.accept_waveform(rate, samples)
+            self._rec.decode_stream(stream)
+            result = stream.result
+        return _result_from_tokens(
+            getattr(result, "text", "") or "",
+            emotion=_clean_tag(getattr(result, "emotion", "")),
+            event=_clean_tag(getattr(result, "event", "")),
+            language=_clean_tag(getattr(result, "lang", "")),
+            intensity=None,  # sherpa does not surface the CTC posteriors
+            raw_tokens=list(getattr(result, "tokens", []) or []),
+        )
+
+
+class _OnnxBackend:
+    """Bare onnxruntime session + the NumPy frontend. Exposes CTC posteriors."""
+
+    name = "onnx"
+
+    def __init__(self, model_path: Path, tokens_path: Path, *, threads: int = DEFAULT_THREADS,
+                 use_itn: bool = True):
+        import onnxruntime as ort
+        opts = ort.SessionOptions()
+        # Utterances are short and arrive serially; a wide pool both steals cores
+        # from the ZONOS3 backbone and, measured, decodes slower anyway.
+        opts.intra_op_num_threads = max(1, int(threads))
+        self._session = ort.InferenceSession(
+            str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])
+        self.text_norm = TEXT_NORM_ON if use_itn else 1
+        self._vocab = _load_vocab(tokens_path)
+        self._lock = threading.Lock()
+
+    def recognise(self, path: Path, *, language: int = 0, ffmpeg: Optional[str] = None) -> EmotionResult:
+        import numpy as np
+        rate, samples = load_audio(path, ffmpeg)
+        if rate != SR:  # the ORT graph is fixed at 16 kHz
+            raise RuntimeError(f"expected {SR} Hz audio, got {rate} Hz")
+        if samples.size == 0:
+            raise RuntimeError("audio decoded to zero samples")
+        feat = _apply_lfr(_fbank(samples))
+        with self._lock:
+            logits = self._session.run(None, {
                 "x": feat[None].astype(np.float32),
                 "x_length": np.array([feat.shape[0]], dtype=np.int32),
-                "language": np.array([language], dtype=np.int32),
-                "text_norm": np.array([text_norm], dtype=np.int32),
+                "language": np.array([int(language)], dtype=np.int32),
+                "text_norm": np.array([self.text_norm], dtype=np.int32),
             })[0][0]
 
-            vocab = self._load_vocab()
-            blank = len(vocab) if len(vocab) not in vocab else max(vocab) + 1
+        vocab = self._vocab
+        # Greedy CTC collapse. Id 0 is ``<unk>`` and doubles as the blank this
+        # export was trained with; the 25055-wide logits have no extra blank row.
+        # (The previous version compared against max(vocab)+1 = 25055, i.e. one
+        # past the end, so it could never have skipped a real blank id.)
+        prev, ids = -1, []
+        for row in logits.argmax(-1):
+            i = int(row)
+            if i != prev and i != 0:
+                ids.append(i)
+            prev = i
+        tokens = [vocab.get(i, "") for i in ids]
 
-            # Greedy CTC collapse (skip repeats and blank).
-            prev, ids, frame_of = -1, [], []
-            for t, row in enumerate(logits.argmax(-1)):
-                i = int(row)
-                if i != prev and i != blank and i != _BLANK_FALLBACK:
-                    ids.append(i)
-                    frame_of.append(t)
-                prev = i
-            tokens = [vocab.get(i, "") for i in ids]
+        parsed = _result_from_tokens(
+            "".join(t for t in tokens if not _is_control(t)),
+            intensity=None, raw_tokens=tokens)
 
-            text_parts, emotion, events, lang = [], "neutral", [], ""
-            for tok in tokens:
-                if tok.startswith("<|") and tok.endswith("|>"):
-                    name = tok[2:-2]
-                    if name in _EMOTIONS:
-                        emotion = name.lower()
-                    elif name in _AUDIO_EVENTS:
-                        if name.lower() not in {e.lower() for e in events}:
-                            events.append(name)
-                    elif len(name) <= 6 and name.isalpha():
-                        # language tags: <|en|>, <|zh|>, <|ja|> ... and the
-                        # <|woitn|>-style normalisation hints, which are all
-                        # short alpha runs. Keep the first plausible language.
-                        if not lang and name not in {"woitn", "withitn"}:
-                            lang = name
-                    continue
-                text_parts.append(tok)
-
-            text = "".join(text_parts).replace("▁", " ").strip()
-
-            intensity = 0.0
-            if emotion not in ("neutral", "unknown"):
-                idx = {v: k for k, v in vocab.items()}.get(f"<|{emotion.upper()}|>")
-                if idx is not None:
-                    probs = _row_softmax(logits, idx)
-                    if probs:
-                        # Calibrate against measured posteriors rather than
-                        # guessing a divisor. On this host the winning emotion
-                        # token's probability ran 0.49-0.93 across real voice
-                        # samples, so a fixed /0.35 pinned everything at 1.0 and
-                        # the dial was useless. Map 0.45..0.95 onto 0..1 instead:
-                        # below 0.45 is a marginal call, at/above 0.95 is a
-                        # decisive one.
-                        raw = probs[0]
-                        intensity = round(min(1.0, max(0.0,
-                                                       (raw - 0.45) / (0.95 - 0.45))), 2)
-
-            return EmotionResult(
-                text=text, emotion=emotion, intensity=intensity, events=events,
-                language=lang, raw_tokens=tokens)
-        except Exception as exc:  # noqa: BLE001 - never break the turn
-            self.last_error = str(exc)
-            logger.warning("sensevoice: recognition failed: %s", exc)
-            return EmotionResult(error=str(exc))
+        if parsed.emotion not in ("neutral", "unknown"):
+            idx = next((k for k, v in vocab.items() if v == f"<|{parsed.emotion.upper()}|>"), None)
+            if idx is not None:
+                probs = _row_softmax(logits, idx)
+                if probs:
+                    # Calibrate against measured posteriors rather than guessing
+                    # a divisor. On this host the winning emotion token's
+                    # probability ran 0.49-0.93 across real voice samples, so a
+                    # fixed /0.35 pinned everything at 1.0 and the dial was
+                    # useless. Map 0.45..0.95 onto 0..1 instead: below 0.45 is a
+                    # marginal call, at/above 0.95 a decisive one.
+                    parsed.intensity = round(min(1.0, max(0.0, (probs[0] - 0.45) / 0.50)), 2)
+        return parsed
 
 
 def _row_softmax(logits, token_id: int) -> list[float]:
@@ -364,3 +439,204 @@ def _row_softmax(logits, token_id: int) -> list[float]:
         out.append(float(e[token_id] / e.sum()))
     out.sort(reverse=True)
     return out
+
+
+_BACKENDS = {"sherpa": _SherpaBackend, "onnx": _OnnxBackend}
+
+
+# --------------------------------------------------------------------------- facade
+
+
+class SenseVoiceEmotion:
+    """Lazy-loaded SenseVoice recogniser that returns transcript + emotion.
+
+    One backend instance, created on first use and reused. CPU-only and
+    int8-quantised, so it neither competes with ZONOS3 for VRAM nor keeps the GPU
+    busy between utterances; a short clip transcribes in ~0.1-0.2 s here.
+
+    ``engine`` picks the runtime:
+
+    * ``onnx`` (default) — bare onnxruntime. Zero extra dependencies, and the
+      only backend that reports the CTC posteriors behind the emotion label, so
+      it is the one that can drive ``intensity``. Measured end-to-end (ffmpeg
+      decode + infer) on this host: 354 ms for a 3 s clip, 537 ms for 5 s — the
+      same as sherpa within noise.
+    * ``sherpa`` — sherpa-onnx, if it is installed (``pip install sherpa-onnx``,
+      28 MB). Its frontend, thread pool and CTC collapse are native, which made
+      it ~3x faster than ORT on *inference alone* (105 ms vs 414 ms for a 3 s
+      clip); once decoding and process overhead are included the two are equal,
+      so it is opt-in and it cannot supply ``intensity``.
+    * ``auto`` — sherpa when importable, else onnx.
+    """
+
+    def __init__(self, model_dir: Optional[Path] = None, *, enabled: bool = True,
+                 ffmpeg: Optional[str] = None, engine: str = "onnx",
+                 threads: int = DEFAULT_THREADS, use_itn: bool = True):
+        self.model_dir = Path(model_dir or os.environ.get("SENSEVOICE_ONNX_DIR")
+                              or DEFAULT_MODEL_DIR)
+        self.enabled = enabled
+        self._ffmpeg = ffmpeg
+        self._engine = (engine or "onnx").strip().lower()
+        self._threads = max(1, int(threads))
+        self._use_itn = bool(use_itn)
+        self._backend = None
+        self._lock = threading.Lock()
+        self.last_error = ""
+
+    # -- paths ------------------------------------------------------------
+    @property
+    def model_path(self) -> Path:
+        return self.model_dir / "model.int8.onnx"
+
+    @property
+    def tokens_path(self) -> Path:
+        return self.model_dir / "tokens.txt"
+
+    @property
+    def engine(self) -> str:
+        """Engine that will be used (resolved without building a session)."""
+        if self._engine in _BACKENDS:
+            return self._engine
+        try:
+            import sherpa_onnx  # noqa: F401
+            return "sherpa"
+        except Exception:  # noqa: BLE001
+            return "onnx"
+
+    def is_available(self) -> bool:
+        """Cheap presence check: no network, no session creation."""
+        if not self.enabled:
+            return False
+        module = "sherpa_onnx" if self.engine == "sherpa" else "onnxruntime"
+        try:
+            __import__(module)
+        except Exception:  # noqa: BLE001
+            return False
+        return self.model_path.is_file() and self.tokens_path.is_file()
+
+    # -- backend ----------------------------------------------------------
+    def _get_backend(self):
+        if self._backend is not None:
+            return self._backend
+        with self._lock:
+            if self._backend is not None:
+                return self._backend
+            name = self.engine
+            cls = _BACKENDS.get(name)
+            if cls is None:
+                raise RuntimeError(f"unknown SenseVoice engine {name!r}")
+            try:
+                self._backend = cls(self.model_path, self.tokens_path,
+                                    threads=self._threads, use_itn=self._use_itn)
+            except Exception:
+                if name != "sherpa":
+                    raise
+                # An unusable sherpa build is still better served by a working
+                # recogniser than by no recogniser.
+                logger.warning("sensevoice: sherpa backend failed; using onnxruntime",
+                               exc_info=True)
+                self._backend = _OnnxBackend(self.model_path, self.tokens_path,
+                                             threads=self._threads, use_itn=self._use_itn)
+        return self._backend
+
+    # -- inference --------------------------------------------------------
+    def recognise(self, audio_path: str | Path, *, language: int = 0,
+                  text_norm: bool = True) -> EmotionResult:
+        """Transcribe and detect the speaker's emotion in one pass.
+
+        ``intensity`` is populated only by the ``onnx`` engine, where it is a
+        heuristic in ``0..1`` derived from how decisively the CTC head picked the
+        emotion token (softmax margin at the frames where that token won). It is
+        a useful ordering — clearly emotional speech scores higher than flat
+        speech — but it is not a calibrated annotation, so downstream code treats
+        it as a dial, not a measurement.
+        """
+        if not self.is_available():
+            return EmotionResult(error="SenseVoice ONNX model or runtime unavailable")
+        try:
+            backend = self._get_backend()
+            if isinstance(backend, _OnnxBackend):
+                backend.text_norm = TEXT_NORM_ON if text_norm else 1
+            return backend.recognise(Path(audio_path), language=language, ffmpeg=self._ffmpeg)
+        except Exception as exc:  # noqa: BLE001 - never break the turn
+            self.last_error = str(exc)
+            logger.warning("sensevoice: recognition failed: %s", exc)
+            return EmotionResult(error=str(exc))
+
+    # -- introspection ----------------------------------------------------
+    def status(self) -> dict[str, Any]:
+        return {"engine": self.engine, "available": self.is_available(),
+                "model_dir": str(self.model_dir), "threads": self._threads,
+                "itn": self._use_itn, "last_error": self.last_error}
+
+
+# --------------------------------------------------------------------------- STT provider
+
+
+def _language_id(language: Optional[str]) -> int:
+    """BCP-47 / informal hint -> SenseVoice language id (0 = auto)."""
+    if not language:
+        return 0
+    key = str(language).strip().lower().replace("_", "-").split("-")[0]
+    return _LANG_IDS.get(key, 0)
+
+
+def make_stt_provider(detector: SenseVoiceEmotion, *, on_result=None,
+                      display_name: str = "SenseVoice"):
+    """Build a host ``TranscriptionProvider`` around an existing detector.
+
+    Imported lazily so this module stays importable outside a Hermes process
+    (tests, benchmarks, dashboards) where ``agent`` is not on the path.
+    """
+    from agent.transcription_provider import TranscriptionProvider
+
+    label = display_name
+
+    class SenseVoiceSTT(TranscriptionProvider):
+        """Hermes speech-to-text backed by the local SenseVoice int8 ONNX model.
+
+        One pass produces both the transcript the user sees and the affect the
+        reply voice uses, which is why selecting this provider makes the
+        ``pre_transcription`` hook's own decode redundant: :meth:`transcribe`
+        reports straight to the pipeline via *on_result*.
+        """
+
+        name = "sensevoice"
+
+        @property
+        def display_name(self) -> str:
+            return label
+
+        def __init__(self, det: SenseVoiceEmotion):
+            self._det = det
+
+        def is_available(self) -> bool:
+            try:
+                return bool(self._det.is_available())
+            except Exception:  # noqa: BLE001
+                return False
+
+        def warm(self) -> None:
+            """Mic opened — build the backend now so the first utterance is warm."""
+            try:
+                if self._det.is_available():
+                    self._det._get_backend()
+            except Exception:  # noqa: BLE001 - warming must never raise
+                logger.debug("sensevoice: warm failed", exc_info=True)
+
+        def transcribe(self, file_path: str, *, model: Optional[str] = None,
+                       language: Optional[str] = None, **extra: Any) -> dict[str, Any]:
+            result = self._det.recognise(file_path, language=_language_id(language))
+            if not result.ok:
+                return {"success": False, "transcript": "", "provider": self.name,
+                        "error": result.error}
+            if on_result is not None:
+                try:
+                    on_result(result)
+                except Exception:  # noqa: BLE001 - affect must never break STT
+                    logger.debug("sensevoice: reporting affect failed", exc_info=True)
+            return {"success": True, "transcript": result.text, "provider": self.name,
+                    "emotion": result.emotion, "events": list(result.events),
+                    "language": result.language}
+
+    return SenseVoiceSTT(detector)

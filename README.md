@@ -174,6 +174,31 @@ directly, and `onnxruntime` is already a Hermes dependency, so
 > the model comes from `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`
 > (int8 ONNX ≈ 234 MB) — but there is no reason to fetch it now.
 
+#### Running it without Voxta
+
+Set `stt_enabled: true` and `stt.provider: sensevoice` and this plugin is the
+speech-recognition engine too: one SenseVoice pass returns the transcript *and*
+the affect, so Voxta (and its 4–12 GB CUDA torch install) is not needed at all
+for voice input. Measured on this host, same audio, 3 s clip:
+
+| path | warm latency | notes |
+|---|---|---|
+| Voxta (`/api/transcription`, fp32 on CUDA) | ~350–510 ms | 11.8 s cold start, needs the server running |
+| this plugin, `sensevoice_engine: onnx` (default) | ~100–180 ms | no extra dependency, reports intensity |
+| this plugin, `sensevoice_engine: sherpa` | ~105 ms infer | needs `pip install sherpa-onnx` (28 MB) |
+
+Accuracy is the same or better in places: Voxta's fp32 run transcribed a Chinese
+sample as `开放9至5.` (truncated, non-deterministic across runs) where this path
+returns `开饭时间早上9点至下午5点。`. Both engines miss the same word on one
+English clip (`gold` → `code`), which is int8 quantization, not the frontend.
+
+> **`text_norm` is a token id, not a flag.** The exported graph resolves
+> `language` and `text_norm` through an embedding table. It must be `14`
+> (`<|withitn|>`) for digits, punctuation and capitalisation; `1` selects
+> `<|woitn|>` and silently returns `fifty pieces of code` instead of
+> `50 pieces of code.`, and out-of-range values crash inside the graph's Gather.
+> The old code passed `1`, which is why punctuation was missing.
+
 Emotion is not a second model. SenseVoice emits **control tokens inside its own
 CTC output** — `<|HAPPY|>`, `<|SAD|>`, `<|ANGRY|>`, `<|NEUTRAL|>`,
 `<|FEARFUL|>`, `<|DISGUSTED|>`, `<|SURPRISED|>` — plus audio events
@@ -248,12 +273,10 @@ def on_pre_transcription(self, **kwargs):
     return None                          # observe only — STT still produces the text
 ```
 
-This is why **Voxta is not needed** for emotion. The hook is a Hermes-native
-extension point that fires on the desktop mic, CLI voice mode and the gateway
-alike, so it covers every surface without patching a host call site and without a
-second process in the loop. Voxta's `/api/transcription` returns only
-`{"text": ...}` anyway — it discards the emotion tag even though SenseVoice runs
-there, so routing through Voxta would have lost the very signal we want.
+This is why the affect never needs a second process in the loop. The hook is a
+Hermes-native extension point that fires on the desktop mic, CLI voice mode and
+the gateway alike, so it covers every surface without patching a host call site.
+
 
 Analysis runs on a daemon thread: the user is waiting for their transcript, and
 blocking STT dispatch to detect a mood would be the wrong trade. Detection takes
@@ -297,6 +320,9 @@ and `voice_emotion_state` (read the pending affect).
 | `ducking_watch` | `hermes.exe` | Process(es) whose audio activity triggers ducking |
 | `ducking_hold_off_seconds` | `1.2` | Keep ducking this long after speech stops |
 | `sensevoice_model_dir` | auto | Override the ONNX model directory |
+| `sensevoice_engine` | `onnx` | `onnx` (no deps, reports intensity) or `sherpa` (needs `sherpa-onnx`, label only) |
+| `sensevoice_threads` | `2` | Decoding threads; 2 measured fastest on this i7-12700K |
+| `stt_enabled` | `false` | Register the `sensevoice` STT provider (set `stt.provider: sensevoice` to use it) |
 
 ### Audio ducking (Windows)
 
