@@ -3,6 +3,6 @@
   "label": "ZONOS3-Mini",
   "description": "ZONOS3-Mini engine residency: whether the model is loaded, how many surfaces hold it, the idle-unload and process-stop windows, and silent-output retries.",
   "icon": "AudioWaveform",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "api": "plugin_api.py"
 }

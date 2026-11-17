@@ -375,6 +375,23 @@ Settings: `ducking_enabled` (`true`), `ducking_factor` (`0.20` ≈ −14 dB),
 `pycaw`/`comtypes` are **not** declared in `pip_dependencies` — they are optional
 and Windows-only; install with `pip install pycaw comtypes` if ducking is wanted.
 
+**Measured on this host** (2026-11-17), with `pycaw 20260927` + `comtypes 1.5.0`
+installed into the gateway's own interpreter
+(`$HERMES_HOME/tools/python-*/python.exe`, not `python` on PATH — installing
+elsewhere leaves the gateway unable to import it and ducking silently reports
+`unavailable`): an `ffplay` session at **100%** went to **20%** during `duck()`
+and back to exactly **100%** on `restore()`, with 2 sessions ducked/restored.
+
+Install into the interpreter the gateway actually runs — a plain
+`pip install pycaw` often targets a different Python. Verify with:
+
+```
+<gateway python> -c "from pycaw.pycaw import AudioUtilities; print(len(AudioUtilities.GetAllSessions()))"
+```
+
+The gateway must **restart** afterwards; `register()` constructs the ducker once,
+so a fresh install is invisible to an already-running process.
+
 ### Audio level: the engine's own output, with steering-based lift
 
 The provider writes the engine's WAV **byte-for-byte** — verified: a synthesis and
