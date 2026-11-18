@@ -461,6 +461,38 @@ def _merge_wav(parts: list[bytes]) -> bytes:
 # --------------------------------------------------------------------------- engine
 
 
+def _pid_running(pid: int) -> bool:
+    """True when *pid* names a live process.
+
+    On Windows ``os.kill(pid, 0)`` is not a probe — it calls TerminateProcess — so
+    liveness comes from OpenProcess/GetExitCodeProcess instead.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 class EngineSupervisor:
     """Owns the ZONOS3 server process and the lease/idle state machine.
 
@@ -812,6 +844,12 @@ class EngineSupervisor:
         Deliberately conservative: an unreadable, stale or malformed file returns
         None, which restores the old "whoever asks may stop it" behaviour. Guessing
         ownership from a fossil would wedge unload instead of fixing it.
+
+        A dead owner must read as None. The engine outlives the process that
+        started it (that is the whole point of adopting a listening server), so a
+        record left by an exited host would otherwise block every unload forever —
+        the engine would be permanently unkillable, which is worse than the
+        cross-process kill this guard exists to prevent.
         """
         try:
             data = json.loads(self._owner_file().read_text(encoding="utf-8"))
@@ -822,6 +860,9 @@ class EngineSupervisor:
             return None
         if not self.is_up():
             return None  # the recorded owner's engine is gone; the record is stale
+        if pid != os.getpid() and not _pid_running(pid):
+            logger.debug("zonos3-tts: owner pid %d is gone; engine is adoptable", pid)
+            return None
         return pid
 
     def _record_owner(self) -> None:
