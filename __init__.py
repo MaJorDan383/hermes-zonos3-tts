@@ -468,19 +468,25 @@ def _trim_edges(samples: "np.ndarray", rate: int, *, lead_ms: int = 40,
 
 
 def _match_levels(parts: list["np.ndarray"], rate: int,
-                  *, enabled: bool = True) -> tuple[list["np.ndarray"], list[float]]:
-    """Bring each part to the loudest part's RMS, so the seams do not step.
+                  *, enabled: bool = True,
+                  cap_db: float = 8.0) -> tuple[list["np.ndarray"], list[float]]:
+    """Bring each part to the reply's median RMS, so the seams do not step.
 
-    The engine's own level wanders between takes — measured spread 3.7 dB across
-    five consecutive sentences, with the last one landing **+2.6 dB** above the
-    mean of the others. Because each sentence is its own request, that variance
-    lands directly on the seam: the voice audibly steps up or down mid-reply, and
-    the final sentence jumps louder just as the reply ends.
+    The engine's own level wanders between takes — measured **6.1 dB** across takes
+    ranging from a 55-character sentence to a one-word "Alright." — and replies
+    routinely END on a short sentence, which is a different take shape altogether.
+    Because each sentence is its own request, that variance lands directly on the
+    seam: the voice steps mid-reply and the last line lands at its own level.
 
-    Speech RMS is a fair proxy here because every part is the same speaker, same
-    cadence, same material class. Corrections are capped at ±6 dB: a part that
-    looks 12 dB quiet is a failed take (or a whisper the text asked for), and
-    normalising that would flatten deliberate dynamics.
+    The target is the MEDIAN, not the loudest part. Matching everything up to the
+    loudest would push the whole reply louder on the strength of one outlier (often
+    the short final sentence), risking the limiter; the median leaves the majority
+    of the reply untouched and pulls the outlier toward them, which is what "even"
+    should mean.
+
+    Corrections are capped at ±8 dB: a part that looks 15 dB quiet is a failed take
+    or a whisper the text asked for, and flattening that would erase intended
+    dynamics.
 
     Returns the adjusted parts and the gain applied to each (dB, for logging).
     """
@@ -498,7 +504,7 @@ def _match_levels(parts: list["np.ndarray"], rate: int,
     speech = [v for v in levels if v > float("-inf")]
     if len(speech) < 2:
         return parts, [0.0] * len(parts)
-    target = max(speech)
+    target = float(np.median(speech))
     gains: list[float] = []
     out: list[np.ndarray] = []
     for part, level in zip(parts, levels):
@@ -506,7 +512,7 @@ def _match_levels(parts: list["np.ndarray"], rate: int,
             gains.append(0.0)
             out.append(part)
             continue
-        gain = max(-6.0, min(6.0, target - level))
+        gain = max(-cap_db, min(cap_db, target - level))
         gains.append(gain)
         out.append(part * (10 ** (gain / 20.0)) if abs(gain) > 0.05 else part)
     return out, gains
@@ -533,13 +539,20 @@ def _parts_to_wav(parts: list["np.ndarray"], channels: int, rate: int) -> bytes:
 def _trim_raw_pcm(pcm: bytes, rate: int, *, lead_ms: int = 40,
                   tail_ms: int = 20, floor: int = 32,
                   ref_db: Optional[float] = None,
-                  level_match: bool = True) -> tuple[bytes, Optional[float]]:
-    """Trim edge silence from raw int16 mono PCM, optionally matching a level.
+                  level_match: bool = True,
+                  cap_db: float = 8.0) -> tuple[bytes, Optional[float]]:
+    """Trim edge silence from raw int16 mono PCM and match it to a reference level.
 
     The streaming path receives bare samples rather than a WAV container, so this
-    wraps :func:`_trim_edges` for it. Returns the new PCM and the reference level
-    in dBFS — the caller passes the first sentence's value back in for the rest so
-    the whole reply shares one gain instead of each sentence choosing its own.
+    wraps :func:`_trim_edges` for it. Returns the new PCM and the level to use as
+    the reference next time.
+
+    The reference is a RUNNING MEDIAN, not the first sentence's level. Callers
+    cannot see the whole reply (the host streams sentence by sentence as tokens
+    arrive), so an anchor set by sentence one would be arbitrary — and if that
+    sentence happened to be short, every later sentence would be matched to an
+    unrepresentative target. A median over what has been heard so far converges on
+    the reply's own norm without needing to see the end of it.
     """
     import math
 
@@ -552,7 +565,7 @@ def _trim_raw_pcm(pcm: bytes, rate: int, *, lead_ms: int = 40,
         return pcm, ref_db
     rms = float(np.sqrt((samples ** 2).mean()))
     level = 20 * math.log10(rms) if rms > 0 else None
-    if ref_db is None:
+    if ref_db is None and level is not None:
         ref_db = level
     trimmed = _trim_edges(samples, rate, lead_ms=lead_ms, tail_ms=tail_ms,
                           floor=floor)
@@ -561,9 +574,7 @@ def _trim_raw_pcm(pcm: bytes, rate: int, *, lead_ms: int = 40,
     if level_match and ref_db is not None:
         rms = float(np.sqrt((trimmed ** 2).mean()))
         if rms > 0:
-            # Cap the correction: a sentence 12 dB down is a failed take or a
-            # deliberate whisper, and flattening that erases intended dynamics.
-            gain = max(-6.0, min(6.0, ref_db - 20 * math.log10(rms)))
+            gain = max(-cap_db, min(cap_db, ref_db - 20 * math.log10(rms)))
             if abs(gain) > 0.05:
                 trimmed = trimmed * (10 ** (gain / 20.0))
     clipped = np.clip(np.rint(trimmed), -32768, 32767).astype("<i2")
@@ -1304,7 +1315,8 @@ class Zonos3TTS(TTSProvider):
                  seam_smoothing: bool = True,
                  level_match: bool = True,
                  seam_lead_ms: int = 40,
-                 seam_tail_ms: int = 20):
+                 seam_tail_ms: int = 20,
+                 fade_out_ms: Optional[int] = None):
         self._sup = supervisor
         self._base_options = dict(options or {})
         self._emotion_aware = emotion_aware
@@ -1336,9 +1348,13 @@ class Zonos3TTS(TTSProvider):
         self._level_match = bool(level_match)
         self._seam_lead_ms = max(0, int(seam_lead_ms))
         self._seam_tail_ms = max(0, int(seam_tail_ms))
-        # Reference level for streamed sentences: the first one sets it so the
-        # rest of the reply shares one gain. None until then.
+        # Engine tail fade in ms; None leaves the server default (40, which
+        # measurably droops the end of every take).
+        self._fade_out_ms = None if fade_out_ms is None else max(0, int(fade_out_ms))
+        # Reference level for streamed sentences: the first one seeds it, then a
+        # running median over the reply's sentences takes over.
         self._stream_ref_db: Optional[float] = None
+        self._stream_levels: list[float] = []
         # Hermes only takes the raw-PCM path when this is true AND
         # stream_sample_rate is valid; the rate is read from the engine's own
         # X-Audio-Sample-Rate header at stream time, so this is just the opt-in.
@@ -1410,6 +1426,7 @@ class Zonos3TTS(TTSProvider):
         # A new reply starts a new level reference; carrying the old one across
         # turns would match this reply to a louder/quieter previous one.
         self._stream_ref_db = None
+        self._stream_levels = []
 
     def is_ready(self) -> bool:
         return self._sup.is_ready()
@@ -1687,6 +1704,15 @@ class Zonos3TTS(TTSProvider):
         if self._headroom_db is not None:
             payload.setdefault("headroom_db", float(self._headroom_db))
 
+        # Tail fade. The engine's default is 40 ms, which costs ~15.6 dB at the
+        # very end of every take against the body level (measured; 0 ms gives
+        # 9.6 dB, which is just normal sentence-final decrescendo). That is the
+        # dip heard at the end of each sentence and of the reply. A short fade
+        # still declicks the splice, so 15 ms keeps the anti-click intent without
+        # the audible droop. 0 disables it entirely.
+        if self._fade_out_ms is not None:
+            payload.setdefault("fade_out_ms", int(self._fade_out_ms))
+
         # Pass through engine request fields (seed, temperature, guidance_scale,
         # accent, condition_values, …). Every request object on this server is
         # CLOSED: an unknown field is a 422, not a no-op — measured, even
@@ -1875,20 +1901,30 @@ class Zonos3TTS(TTSProvider):
         """Trim and level-match one streamed sentence for playback.
 
         The engine renders each harness sentence as a standalone utterance, so a
-        stream carries the same front padding a WAV does (~230 ms measured). The
+        stream carries the same front padding a WAV does (~240 ms measured). The
         host feeds PortAudio directly, so nothing downstream removes it — it is
         heard as a gap before every sentence.
 
-        Level matching is between stream CALLS, so the reference is carried on the
-        instance: the first sentence sets it, later ones are matched back to it.
-        Without that, the device gain stays constant and every wobble in the
-        engine's take-level is audible as the volume stepping mid-reply.
+        Level matching runs against a running median of the reply's sentences
+        (``_stream_levels``). The whole reply is not visible here — sentences
+        arrive as the model writes them — so an anchor from sentence one would be
+        arbitrary, and matching everything to the loudest would leave the last
+        line at whatever level it happened to render.
         """
         if not pcm:
             return pcm
-        out, self._stream_ref_db = _trim_raw_pcm(
+        import numpy as np
+
+        out, level = _trim_raw_pcm(
             pcm, rate, lead_ms=self._seam_lead_ms, tail_ms=self._seam_tail_ms,
             ref_db=self._stream_ref_db, level_match=self._level_match)
+        if level is not None:
+            self._stream_levels.append(level)
+            # Keep the window bounded: a long reply should not let its first
+            # sentences weigh as much as its last.
+            if len(self._stream_levels) > 9:
+                del self._stream_levels[0]
+            self._stream_ref_db = float(np.median(self._stream_levels))
         return out
 
     def _char_budget(self) -> int:
@@ -2098,6 +2134,8 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
         level_match=_bool_setting(ctx, "level_match", True),
         seam_lead_ms=int(_setting(ctx, "seam_lead_ms", 40) or 0),
         seam_tail_ms=int(_setting(ctx, "seam_tail_ms", 20) or 0),
+        fade_out_ms=(None if _setting(ctx, "fade_out_ms", None) is None
+                     else int(_setting(ctx, "fade_out_ms", 15) or 0)),
     )
     ctx.register_tts_provider(provider)
 

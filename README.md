@@ -336,6 +336,7 @@ and `voice_emotion_state` (read the pending affect).
 | `level_match` | `true` | Bring each chunk to the loudest chunk's RMS (capped ±6 dB) |
 | `seam_lead_ms` | `40` | Natural silence kept before each chunk's onset |
 | `seam_tail_ms` | `20` | Natural silence kept after each chunk's end |
+| `fade_out_ms` | `null` (engine: 40) | Engine tail declick; affects only the last ~20-50 ms |
 
 ### Emotion: what SenseVoice actually gives you
 
@@ -380,43 +381,53 @@ only, so intensity is `None` there rather than a fabricated number.
 Read-aloud does not speak a reply as one utterance. The host cuts it into
 sentences and calls the provider once per sentence, and above one engine take the
 plugin splits it again. So a reply is a **series of independent engine requests**,
-and the engine treats each as a standalone utterance with three consequences that
-are audible exactly where the complaint points:
+and the engine treats each as a standalone utterance. Two consequences are
+audible exactly where the complaint points:
 
 | Engine behaviour (measured) | What it sounds like |
 |---|---|
 | Pads the front of every take: 224–280 ms of silence | A gap before every sentence |
-| Chooses its own level per take: **5.1 dB** spread over five sentences | Volume steps up and down mid-reply |
-| Fades its own tail (`fade_out_ms`, default 40) | The tail of each sentence, and the reply's end, dips |
+| Chooses its own level per take: **6.1 dB** spread, from a 55-char sentence to a one-word "Alright." | Volume steps up and down mid-reply |
 
-Splicing those parts verbatim — which is what both paths used to do — makes the
-report "the volume dips in and out, especially between sentences and near the
-end" a literal description of the signal.
+Replies usually **end on a short sentence**, which is a different take shape
+entirely — measured, a short closer landed 3.5 dB below the body of the reply.
+That is the dip heard near the end.
 
-`seam_smoothing` (default **on**) fixes all three before playback:
+`seam_smoothing` (default **on**) fixes both before playback:
 
 - **`_trim_edges`** cuts the padded silence to a short natural margin
   (`seam_lead_ms` 40, `seam_tail_ms` 20). The margin is deliberate: splicing at
-  the first non-zero sample clips the onset and sounds clipped, so a little
-  silence is kept.
-- **`_match_levels`** brings every part to the loudest part's RMS. Corrections are
-  capped at ±6 dB — a part 12 dB down is a failed take or a deliberate whisper,
-  and normalising that would erase intended dynamics.
-- The **streaming** path gets its own version (`_trim_raw_pcm`) because PortAudio
-  consumes bare PCM with nothing downstream to clean it. Its reference level is
-  carried per reply, so all sentences share one gain, and reset on lease release
-  so a reply is not matched to the level of the previous one.
+  the first non-zero sample clips the onset, so a little silence is kept.
+- **`_match_levels`** brings every part to the reply's **median** RMS. Median, not
+  maximum: matching everything up to the loudest part would push the whole reply
+  louder on the strength of one outlier — usually that short final sentence — and
+  risk the limiter. Corrections are capped at ±8 dB, because a part 15 dB down is
+  a failed take or a deliberate whisper and flattening it erases intended
+  dynamics.
+- The **streaming** path has its own version (`_trim_raw_pcm`) because PortAudio
+  consumes bare PCM with nothing downstream to clean it. Its reference is a
+  **running median** over the reply's sentences — the whole reply is not visible
+  while it streams, so anchoring on sentence one would be arbitrary and a short
+  first sentence would mis-set the target for all the rest.
 
-Measured on five sentences, streaming path:
+Measured on six sentences ending in a one-word closer, streaming path:
 
 | | Before | After |
 |---|---|---|
-| Level spread across sentences | 5.1 dB | **0.0 dB** |
+| Level spread across sentences | 5.1 dB | **1.1 dB** |
 | Leading silence per sentence | 241 ms | **40 ms** |
 | Silence at each seam | 135 ms | **24 ms** |
+| Short closer vs the rest | **−3.5 dB** | **+1.1 dB** |
 
-Settings: `seam_smoothing`, `level_match`, `seam_lead_ms`, `seam_tail_ms`.
-Turning `seam_smoothing` off restores raw concatenation.
+Settings: `seam_smoothing`, `level_match`, `seam_lead_ms`, `seam_tail_ms`,
+`fade_out_ms`. Turning `seam_smoothing` off restores raw concatenation.
+
+**On `fade_out_ms`** (engine field, default 40): it is real and it does change the
+audio, but it only shapes the final ~20–50 ms — measured, 40 ms costs 15.6 dB at
+the last 20 ms against 9.6 dB for 0 ms. It declicks the tail; it is *not* the
+source of a dip you can hear over the last word. Left at the engine default
+(`fade_out_ms: null`). Raising it makes the ending noticeably clipped; a large
+value (200+) is what actually fades a line out.
 
 ### When the engine is allowed to load
 
