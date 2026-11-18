@@ -62,6 +62,14 @@ logger = logging.getLogger(__name__)
 SR = 16000
 
 
+class AudioDecodeError(RuntimeError):
+    """Audio could not be turned into samples (empty, truncated, not audio).
+
+    Distinct from a generic RuntimeError so the STT envelope can report a message
+    the caller can act on instead of ffmpeg's internal diagnostics.
+    """
+
+
 def _silence_wav(seconds: float = 0.5, rate: int = SR) -> bytes:
     """A minimal mono 16-bit PCM WAV of silence, for warming a backend.
 
@@ -272,9 +280,27 @@ def load_audio(path: Path, ffmpeg: Optional[str] = None):
             stdin=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
         if proc.returncode != 0 or not out.is_file():
-            raise RuntimeError(f"ffmpeg could not decode {path.name}: {proc.stderr[:200]}")
+            # A bad upload (empty, truncated, or not audio at all) reaches here as
+            # an ffmpeg decode failure, and ffmpeg's stderr names a temp file the
+            # caller has never heard of. Surface a sentence a person can act on,
+            # and keep the raw text in the log for debugging.
+            size = path.stat().st_size if path.exists() else 0
+            if size == 0:
+                raise AudioDecodeError("the recording was empty (0 bytes)")
+            if size < 128:
+                raise AudioDecodeError(
+                    f"the recording was too short to contain audio ({size} bytes)")
+            detail = (proc.stderr or "").strip().splitlines()
+            first = detail[0] if detail else "unknown decoder error"
+            logger.info("sensevoice: ffmpeg could not decode %s (%d bytes): %s",
+                        path.name, size, " | ".join(detail[:3]))
+            raise AudioDecodeError(
+                "the upload could not be decoded as audio — it was empty, "
+                f"truncated, or not an audio file ({size} bytes)")
         with wave.open(str(out), "rb") as w:
             raw = w.readframes(w.getnframes())
+    if not raw:
+        raise AudioDecodeError("the recording decoded to silence (no samples)")
     return SR, np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
 
 
