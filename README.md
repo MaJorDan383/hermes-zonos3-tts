@@ -332,6 +332,10 @@ and `voice_emotion_state` (read the pending affect).
 | `sensevoice_engine` | `onnx` | `onnx` (no deps, reports intensity) or `sherpa` (needs `sherpa-onnx`, label only) |
 | `sensevoice_threads` | `2` | Decoding threads; 2 measured fastest on this i7-12700K |
 | `stt_enabled` | `false` | Register the `sensevoice` STT provider (set `stt.provider: sensevoice` to use it) |
+| `seam_smoothing` | `true` | Trim per-sentence edge padding and match chunk levels before playback |
+| `level_match` | `true` | Bring each chunk to the loudest chunk's RMS (capped ±6 dB) |
+| `seam_lead_ms` | `40` | Natural silence kept before each chunk's onset |
+| `seam_tail_ms` | `20` | Natural silence kept after each chunk's end |
 
 ### Emotion: what SenseVoice actually gives you
 
@@ -370,6 +374,49 @@ artefacts (`Speech`, `Speech_Noise`, `BGM`) never do.
 token's CTC posterior from 0.45–0.95 onto 0–1, calibrated against measured
 real-speech posteriors; below 0.45 is a marginal call. `sherpa` reports the label
 only, so intensity is `None` there rather than a fabricated number.
+
+### Why the volume dipped between sentences, and what fixes it
+
+Read-aloud does not speak a reply as one utterance. The host cuts it into
+sentences and calls the provider once per sentence, and above one engine take the
+plugin splits it again. So a reply is a **series of independent engine requests**,
+and the engine treats each as a standalone utterance with three consequences that
+are audible exactly where the complaint points:
+
+| Engine behaviour (measured) | What it sounds like |
+|---|---|
+| Pads the front of every take: 224–280 ms of silence | A gap before every sentence |
+| Chooses its own level per take: **5.1 dB** spread over five sentences | Volume steps up and down mid-reply |
+| Fades its own tail (`fade_out_ms`, default 40) | The tail of each sentence, and the reply's end, dips |
+
+Splicing those parts verbatim — which is what both paths used to do — makes the
+report "the volume dips in and out, especially between sentences and near the
+end" a literal description of the signal.
+
+`seam_smoothing` (default **on**) fixes all three before playback:
+
+- **`_trim_edges`** cuts the padded silence to a short natural margin
+  (`seam_lead_ms` 40, `seam_tail_ms` 20). The margin is deliberate: splicing at
+  the first non-zero sample clips the onset and sounds clipped, so a little
+  silence is kept.
+- **`_match_levels`** brings every part to the loudest part's RMS. Corrections are
+  capped at ±6 dB — a part 12 dB down is a failed take or a deliberate whisper,
+  and normalising that would erase intended dynamics.
+- The **streaming** path gets its own version (`_trim_raw_pcm`) because PortAudio
+  consumes bare PCM with nothing downstream to clean it. Its reference level is
+  carried per reply, so all sentences share one gain, and reset on lease release
+  so a reply is not matched to the level of the previous one.
+
+Measured on five sentences, streaming path:
+
+| | Before | After |
+|---|---|---|
+| Level spread across sentences | 5.1 dB | **0.0 dB** |
+| Leading silence per sentence | 241 ms | **40 ms** |
+| Silence at each seam | 135 ms | **24 ms** |
+
+Settings: `seam_smoothing`, `level_match`, `seam_lead_ms`, `seam_tail_ms`.
+Turning `seam_smoothing` off restores raw concatenation.
 
 ### When the engine is allowed to load
 

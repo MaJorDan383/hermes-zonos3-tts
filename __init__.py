@@ -423,6 +423,153 @@ def _split_for_engine(text: str, budget: int) -> list[str]:
     ]
 
 
+def _wav_pcm(wav: bytes) -> tuple["np.ndarray", int, int] | tuple[None, int, int]:
+    """Decode a WAV to (int16 samples, channels, rate). Never raises."""
+    import io
+    import wave
+
+    import numpy as np
+
+    try:
+        with wave.open(io.BytesIO(wav)) as src:
+            channels = src.getnchannels()
+            width = src.getsampwidth()
+            rate = src.getframerate()
+            raw = src.readframes(src.getnframes())
+    except Exception:  # noqa: BLE001 - a bad part is skipped, not fatal
+        return None, 0, 0
+    if width != 2 or not raw:
+        return None, channels, rate
+    return np.frombuffer(raw, dtype="<i2").astype(np.float64), channels, rate
+
+
+def _trim_edges(samples: "np.ndarray", rate: int, *, lead_ms: int = 40,
+                tail_ms: int = 20, floor: int = 32) -> "np.ndarray":
+    """Cut the leading and trailing silence, keeping a short natural margin.
+
+    Every request renders in isolation, and the engine pads both ends (measured:
+    202-256 ms of leading silence, 0-49 ms trailing). Concatenating those parts
+    adds a quarter second of dead air AT EVERY SEAM, which is heard as the voice
+    gapping between sentences. Keeping `lead_ms` / `tail_ms` of real margin stops
+    the splice from sounding clipped while removing the bulk of the pause.
+    """
+    import numpy as np
+
+    if samples is None or samples.size == 0:
+        return samples
+    loud = np.nonzero(np.abs(samples) > floor)[0]
+    if loud.size == 0:
+        return samples
+    lead = int(rate * lead_ms / 1000)
+    tail = int(rate * tail_ms / 1000)
+    start = max(0, int(loud[0]) - lead)
+    end = min(samples.size, int(loud[-1]) + 1 + tail)
+    return samples[start:end]
+
+
+def _match_levels(parts: list["np.ndarray"], rate: int,
+                  *, enabled: bool = True) -> tuple[list["np.ndarray"], list[float]]:
+    """Bring each part to the loudest part's RMS, so the seams do not step.
+
+    The engine's own level wanders between takes — measured spread 3.7 dB across
+    five consecutive sentences, with the last one landing **+2.6 dB** above the
+    mean of the others. Because each sentence is its own request, that variance
+    lands directly on the seam: the voice audibly steps up or down mid-reply, and
+    the final sentence jumps louder just as the reply ends.
+
+    Speech RMS is a fair proxy here because every part is the same speaker, same
+    cadence, same material class. Corrections are capped at ±6 dB: a part that
+    looks 12 dB quiet is a failed take (or a whisper the text asked for), and
+    normalising that would flatten deliberate dynamics.
+
+    Returns the adjusted parts and the gain applied to each (dB, for logging).
+    """
+    import numpy as np
+
+    if not enabled or len(parts) < 2:
+        return parts, [0.0] * len(parts)
+    levels: list[float] = []
+    for part in parts:
+        if part is None or part.size == 0:
+            levels.append(float("-inf"))
+            continue
+        rms = float(np.sqrt((part ** 2).mean()))
+        levels.append(20 * np.log10(rms) if rms > 0 else float("-inf"))
+    speech = [v for v in levels if v > float("-inf")]
+    if len(speech) < 2:
+        return parts, [0.0] * len(parts)
+    target = max(speech)
+    gains: list[float] = []
+    out: list[np.ndarray] = []
+    for part, level in zip(parts, levels):
+        if part is None or level == float("-inf"):
+            gains.append(0.0)
+            out.append(part)
+            continue
+        gain = max(-6.0, min(6.0, target - level))
+        gains.append(gain)
+        out.append(part * (10 ** (gain / 20.0)) if abs(gain) > 0.05 else part)
+    return out, gains
+
+
+def _parts_to_wav(parts: list["np.ndarray"], channels: int, rate: int) -> bytes:
+    """Build one honest WAV from adjusted sample arrays."""
+    import io
+    import wave
+
+    import numpy as np
+
+    pcm = np.concatenate([p for p in parts if p is not None and p.size])
+    clipped = np.clip(np.rint(pcm), -32768, 32767).astype("<i2")
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as dst:
+        dst.setnchannels(channels or 1)
+        dst.setsampwidth(2)
+        dst.setframerate(rate or 44100)
+        dst.writeframes(clipped.tobytes())
+    return buffer.getvalue()
+
+
+def _trim_raw_pcm(pcm: bytes, rate: int, *, lead_ms: int = 40,
+                  tail_ms: int = 20, floor: int = 32,
+                  ref_db: Optional[float] = None,
+                  level_match: bool = True) -> tuple[bytes, Optional[float]]:
+    """Trim edge silence from raw int16 mono PCM, optionally matching a level.
+
+    The streaming path receives bare samples rather than a WAV container, so this
+    wraps :func:`_trim_edges` for it. Returns the new PCM and the reference level
+    in dBFS — the caller passes the first sentence's value back in for the rest so
+    the whole reply shares one gain instead of each sentence choosing its own.
+    """
+    import math
+
+    import numpy as np
+
+    if not pcm:
+        return pcm, ref_db
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+    if samples.size == 0:
+        return pcm, ref_db
+    rms = float(np.sqrt((samples ** 2).mean()))
+    level = 20 * math.log10(rms) if rms > 0 else None
+    if ref_db is None:
+        ref_db = level
+    trimmed = _trim_edges(samples, rate, lead_ms=lead_ms, tail_ms=tail_ms,
+                          floor=floor)
+    if trimmed is None or trimmed.size == 0:
+        return pcm, ref_db
+    if level_match and ref_db is not None:
+        rms = float(np.sqrt((trimmed ** 2).mean()))
+        if rms > 0:
+            # Cap the correction: a sentence 12 dB down is a failed take or a
+            # deliberate whisper, and flattening that erases intended dynamics.
+            gain = max(-6.0, min(6.0, ref_db - 20 * math.log10(rms)))
+            if abs(gain) > 0.05:
+                trimmed = trimmed * (10 ** (gain / 20.0))
+    clipped = np.clip(np.rint(trimmed), -32768, 32767).astype("<i2")
+    return clipped.tobytes(), ref_db
+
+
 def _merge_wav(parts: list[bytes]) -> bytes:
     """Concatenate WAV bodies into one WAV, keeping the first header's format.
 
@@ -1153,7 +1300,11 @@ class Zonos3TTS(TTSProvider):
                  steer_hold: Optional[float] = None,
                  steer_onset: Optional[float] = None,
                  steer_ramp: Optional[float] = None,
-                 headroom_db: Optional[float] = None):
+                 headroom_db: Optional[float] = None,
+                 seam_smoothing: bool = True,
+                 level_match: bool = True,
+                 seam_lead_ms: int = 40,
+                 seam_tail_ms: int = 20):
         self._sup = supervisor
         self._base_options = dict(options or {})
         self._emotion_aware = emotion_aware
@@ -1179,6 +1330,15 @@ class Zonos3TTS(TTSProvider):
         # 0 recovers the engine's default 3 dB attenuation for free; None leaves
         # the server default alone rather than assuming it.
         self._headroom_db = None if headroom_db is None else max(0.0, float(headroom_db))
+        # Seam smoothing: trim the per-request edge padding and match chunk levels
+        # before splicing. Off disables both, restoring the raw concatenation.
+        self._seam_smoothing = bool(seam_smoothing)
+        self._level_match = bool(level_match)
+        self._seam_lead_ms = max(0, int(seam_lead_ms))
+        self._seam_tail_ms = max(0, int(seam_tail_ms))
+        # Reference level for streamed sentences: the first one sets it so the
+        # rest of the reply shares one gain. None until then.
+        self._stream_ref_db: Optional[float] = None
         # Hermes only takes the raw-PCM path when this is true AND
         # stream_sample_rate is valid; the rate is read from the engine's own
         # X-Audio-Sample-Rate header at stream time, so this is just the opt-in.
@@ -1247,6 +1407,9 @@ class Zonos3TTS(TTSProvider):
 
     def release(self) -> None:
         self._sup.release()
+        # A new reply starts a new level reference; carrying the old one across
+        # turns would match this reply to a louder/quieter previous one.
+        self._stream_ref_db = None
 
     def is_ready(self) -> bool:
         return self._sup.is_ready()
@@ -1563,6 +1726,7 @@ class Zonos3TTS(TTSProvider):
             return
         payload = self._payload(text, voice, speed, extra)
         chunks = None
+        buffered = b""
         try:
             try:
                 rate, _channels, chunks = self._sup.client.generate_pcm(
@@ -1585,7 +1749,23 @@ class Zonos3TTS(TTSProvider):
             # abandonment to the inner generator without this frame ever learning
             # about it.
             for chunk in chunks:
-                yield chunk
+                if not self._seam_smoothing:
+                    yield chunk
+                    continue
+                # The host cuts the reply into sentences and calls us once per
+                # sentence, so the seams a reader hears are between STREAM calls,
+                # not inside one. Each call therefore pads the front the way a
+                # standalone utterance does, and streaming it verbatim puts
+                # ~230 ms of dead air before every sentence. Buffer this
+                # sentence, trim its edges, match it to the level of the reply so
+                # far, then stream the result — the trim costs one sentence of
+                # latency, which the sentence chunker already imposes.
+                buffered += chunk
+            if not self._seam_smoothing:
+                return
+            final = self._stream_ready(buffered, int(rate))
+            for offset in range(0, len(final), self._stream_out_size):
+                yield final[offset:offset + self._stream_out_size]
         finally:
             if chunks is not None:
                 try:
@@ -1628,15 +1808,88 @@ class Zonos3TTS(TTSProvider):
         else:
             speaker = self._sup.resolve_voice(voice)
 
-        audio = _merge_wav([
+        parts_raw = [
             self._synthesize_one(piece, voice, speed, extra,
                                  speaker=speaker, clip_b64=clip_b64)
             for piece in pieces
-        ])
+        ]
+        audio = self._assemble(parts_raw)
         out.write_bytes(audio)
         logger.info("zonos3-tts: %d bytes (peak %d) -> %s",
                     len(audio), wav_peak(audio), out)
         return str(out)
+
+    def _assemble(self, parts: list[bytes]) -> bytes:
+        """Join per-sentence engine takes into one smooth reply.
+
+        A long reply is several isolated requests, and the engine treats each as a
+        standalone utterance: it pads the front (measured 202-256 ms of silence),
+        fades its own tail, and lands at whatever level that take happened to
+        choose (measured 3.7 dB spread across five consecutive sentences, with the
+        last **+2.6 dB** above the mean). Spliced naively — which is what this used
+        to do — those three effects are exactly the reported symptom: the voice
+        gaps between sentences and steps in volume, and the final sentence jumps
+        loud just as the reply ends.
+
+        So each part is edge-trimmed to a short natural margin and level-matched
+        to the loudest part before the splice. Single-part replies skip all of it
+        (nothing to match, and trimming would only risk clipping a deliberate
+        leading pause).
+        """
+        if len(parts) <= 1:
+            return _merge_wav(parts)
+        if not self._seam_smoothing:
+            return _merge_wav(parts)
+
+        decoded = [_wav_pcm(part) for part in parts]
+        samples = [d[0] for d in decoded if d[0] is not None]
+        if len(samples) != len(parts):
+            # An unreadable part means we cannot match levels honestly; fall back
+            # to the plain splice rather than silently dropping audio.
+            logger.debug("zonos3-tts: seam smoothing skipped (undecodable part)")
+            return _merge_wav(parts)
+        channels = decoded[0][1] or 1
+        rate = decoded[0][2] or 44100
+        if any(d[1] != channels or d[2] != rate for d in decoded):
+            logger.debug("zonos3-tts: seam smoothing skipped (mixed formats)")
+            return _merge_wav(parts)
+
+        trimmed = [_trim_edges(part, rate, lead_ms=self._seam_lead_ms,
+                               tail_ms=self._seam_tail_ms) for part in samples]
+        if channels > 1:
+            # Level matching is a per-sample gain, so interleaved channels work
+            # as one array; trim operates on sample indices, which for stereo
+            # lands mid-frame. Keep stereo untouched rather than de-interleave
+            # for a cosmetic gain — the engine is mono (measured) anyway.
+            return _merge_wav(parts)
+        matched, gains = _match_levels(trimmed, rate, enabled=self._level_match)
+        if self._level_match and any(abs(g) > 0.05 for g in gains):
+            logger.info("zonos3-tts: matched %d chunks to the loudest "
+                        "(gains %s dB)", len(gains),
+                        ", ".join(f"{g:+.1f}" for g in gains))
+        return _parts_to_wav(matched, channels, rate)
+
+    _stream_out_size = 32 * 1024  # one PortAudio-friendly write (int16 bytes)
+
+    def _stream_ready(self, pcm: bytes, rate: int) -> bytes:
+        """Trim and level-match one streamed sentence for playback.
+
+        The engine renders each harness sentence as a standalone utterance, so a
+        stream carries the same front padding a WAV does (~230 ms measured). The
+        host feeds PortAudio directly, so nothing downstream removes it — it is
+        heard as a gap before every sentence.
+
+        Level matching is between stream CALLS, so the reference is carried on the
+        instance: the first sentence sets it, later ones are matched back to it.
+        Without that, the device gain stays constant and every wobble in the
+        engine's take-level is audible as the volume stepping mid-reply.
+        """
+        if not pcm:
+            return pcm
+        out, self._stream_ref_db = _trim_raw_pcm(
+            pcm, rate, lead_ms=self._seam_lead_ms, tail_ms=self._seam_tail_ms,
+            ref_db=self._stream_ref_db, level_match=self._level_match)
+        return out
 
     def _char_budget(self) -> int:
         """Characters that safely fit one engine take.
@@ -1841,6 +2094,10 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
         steer_ramp=_float_setting(ctx, "steer_ramp_seconds", _DEFAULT_STEER_RAMP),
         headroom_db=(_float_setting(ctx, "headroom_db", -1.0)
                      if _setting(ctx, "headroom_db", None) is not None else None),
+        seam_smoothing=_bool_setting(ctx, "seam_smoothing", True),
+        level_match=_bool_setting(ctx, "level_match", True),
+        seam_lead_ms=int(_setting(ctx, "seam_lead_ms", 40) or 0),
+        seam_tail_ms=int(_setting(ctx, "seam_tail_ms", 20) or 0),
     )
     ctx.register_tts_provider(provider)
 
