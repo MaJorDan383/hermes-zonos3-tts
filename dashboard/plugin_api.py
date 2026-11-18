@@ -46,23 +46,29 @@ def _state_path() -> Path:
 
 
 def _read_state() -> Dict[str, Any]:
-    """Newest valid snapshot from the per-writer state files.
+    """The most trustworthy snapshot among the per-writer state files.
 
     More than one process can host this plugin (the gateway serves read-aloud, the
-    dashboard serves the chip's routes), and each constructs its own supervisor
-    and publishes its own snapshot. A single shared file then flickers: whichever
-    process wrote last wins, so a stale instance can overwrite a fresh one and the
-    chip reports "no streaming" for a provider that is streaming.
+    dashboard serves the chip's routes, the relay serves voice), and each
+    constructs its own supervisor and publishes its own snapshot. A single shared
+    file then flickers: whichever process wrote last wins, so a stale instance can
+    overwrite a fresh one and the chip reports "no streaming" for a provider that
+    is streaming. So each writer publishes to `_engine_state.<pid>.json` and this
+    reader picks between them.
 
-    So each writer publishes to `_engine_state.<pid>.json` and this reader returns
-    the freshest snapshot, ignoring fossils. The legacy unsuffixed file is still
-    read so an older writer keeps working.
+    Picking the NEWEST is not enough, and the bug that taught us is worth naming:
+    a process whose supervisor never loaded anything still publishes
+    `{"tts": "idle", "pid": 0}` forever, and when its tick lands between two
+    others' the chip flaps warm → idle → unloaded while the engine never moved.
+    So writers that have actual evidence (an engine pid, or `warm`) outrank writers
+    that only have an opinion; recency breaks ties within that. A dead writer is
+    ignored outright. The legacy unsuffixed file is still read so an older writer
+    keeps working.
     """
     folder = _state_path().parent
     best: Dict[str, Any] = {}
-    best_at = -1.0
-    candidates = sorted(folder.glob("_engine_state*.json"))
-    for path in candidates:
+    best_key = (-1.0, -1.0)
+    for path in sorted(folder.glob("_engine_state*.json")):
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -71,8 +77,25 @@ def _read_state() -> Dict[str, Any]:
             at = float(state.get("updated_at") or 0)
         except (TypeError, ValueError):
             continue
-        if at > best_at:
-            best, best_at = state, at
+        owner = state.get("agent_pid")
+        if owner is not None and not _pid_alive(owner):
+            continue  # a fossil from a process that exited
+        try:
+            engine_pid = int(state.get("pid") or 0)
+        except (TypeError, ValueError):
+            engine_pid = 0
+        # Evidence outranks opinion, in tiers: a live engine pid is proof; "warm"
+        # with pid 0 is an adopted engine (real, but unverifiable here); anything
+        # else is a writer with nothing loaded. Recency breaks ties per tier.
+        if engine_pid > 0 and _pid_alive(engine_pid):
+            evidence = 2.0
+        elif state.get("tts") == "warm":
+            evidence = 1.0
+        else:
+            evidence = 0.0
+        key = (evidence, at)
+        if key > best_key:
+            best, best_key = state, key
     return best
 
 

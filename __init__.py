@@ -513,6 +513,9 @@ class EngineSupervisor:
         self._held = False
         self._publisher = None
         self._voices: list[dict] = []
+        # Unix time before which a failed catalogue probe is not retried, so a
+        # repainting picker cannot pay the 2 s connect timeout per call.
+        self._down_until = 0.0
         # speaker id -> controls the server reports as inert for it
         self._disabled_cache: dict[str, frozenset[str]] = {}
 
@@ -622,6 +625,9 @@ class EngineSupervisor:
             self._starting = False
         logger.info("zonos3-tts: server started pid=%s port=%s",
                     getattr(self._proc, "pid", "?"), self.port)
+        # Claim it: this process spawned the engine, so it — and only it — may
+        # stop it. Peers that adopted the same port must not kill it.
+        self._record_owner()
 
     def _wait_up(self, deadline: float) -> bool:
         while time.time() < deadline:
@@ -793,6 +799,43 @@ class EngineSupervisor:
         logger.info("zonos3-tts: manual unload requested")
         return self.stop_process()
 
+    def _owner_file(self) -> Path:
+        """Where the engine's owning pid is recorded (one engine per home)."""
+        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+        folder = home / "cache" / "zonos3-tts"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / "_engine_owner.json"
+
+    def _engine_owner_pid(self) -> Optional[int]:
+        """Pid of the process that spawned the running engine, or None if unknown.
+
+        Deliberately conservative: an unreadable, stale or malformed file returns
+        None, which restores the old "whoever asks may stop it" behaviour. Guessing
+        ownership from a fossil would wedge unload instead of fixing it.
+        """
+        try:
+            data = json.loads(self._owner_file().read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - no record is a valid state
+            return None
+        pid = data.get("owner_pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        if not self.is_up():
+            return None  # the recorded owner's engine is gone; the record is stale
+        return pid
+
+    def _record_owner(self) -> None:
+        """Claim the running engine for this process."""
+        try:
+            target = self._owner_file()
+            tmp = target.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"owner_pid": os.getpid(),
+                                       "port": self.port,
+                                       "at": time.time()}), encoding="utf-8")
+            os.replace(tmp, target)
+        except Exception as exc:  # noqa: BLE001 - a missing record is survivable
+            logger.debug("zonos3-tts: could not record engine ownership: %s", exc)
+
     def _stop_orphan_engine(self) -> bool:
         """Stop an engine this object did not spawn. True when a process was stopped.
 
@@ -802,11 +845,20 @@ class EngineSupervisor:
         only terminates the child leaves the engine resident and the state stuck
         at "warm" forever.
 
-        Scoped tightly on purpose: only a process whose image name matches this
-        plugin's server binary is a candidate, and only when it is not this
-        process. Killing by name alone would be reckless on a shared host, so the
-        match is the server binary's own stem.
+        **Only when this object may own it.** Several hosts can run this plugin at
+        once — the gateway serves read-aloud, the dashboard serves the chip, the
+        relay serves voice — and they all talk to the same port. The engine is one
+        shared resource, so the process that started it is the only one entitled
+        to kill it; a peer unloading its own lease must not yank the engine out
+        from under a host that is mid-sentence. Ownership is recorded in a small
+        owner file when the engine is spawned, and adoption reads it.
         """
+        stem_owner = self._engine_owner_pid()
+        if stem_owner is not None and stem_owner != os.getpid():
+            logger.info(
+                "zonos3-tts: engine is owned by pid %d; leaving it running "
+                "(this process only drops its own lease)", stem_owner)
+            return False
         name = self.exe.name if getattr(self, "exe", None) else "zonos3-server.exe"
         stem = Path(name).stem
         stopped = False
@@ -932,11 +984,25 @@ class EngineSupervisor:
 
     # -- voices -----------------------------------------------------------
     def voices(self, refresh: bool = False) -> list[dict]:
+        """The server's voice catalogue, cached once known.
+
+        A READ path: it must never start the engine. When the engine is down this
+        returns whatever was cached (often nothing) instead of paying a failed
+        probe, and the caller degrades — a picker with no entries beats a picker
+        that silently loads 3.3 GB of VRAM because it was repainted.
+        """
         if self._voices and not refresh:
+            return self._voices
+        # Skip a doomed probe for a moment after one failed: paints and per-turn
+        # lookups would otherwise each pay the 2 s connect timeout.
+        if not refresh and time.time() < self._down_until:
             return self._voices
         people = self.client.speakers()
         if people:
             self._voices = people
+            self._down_until = 0.0
+        else:
+            self._down_until = time.time() + 3.0
         return self._voices
 
     def disabled_controls(self, speaker_id: Optional[str]) -> frozenset[str]:
@@ -965,21 +1031,25 @@ class EngineSupervisor:
         self._disabled_cache[speaker_id] = found
         return found
 
-    def resolve_voice(self, voice: Optional[str]) -> Optional[str]:
-        """Map a name ("Savannah") or an id to a speaker id the server accepts.
+    def resolve_voice(self, voice: Optional[str], *, spawn: bool = True) -> Optional[str]:
+        """Map a name (``"Savannah"``) or an id to a speaker id the server accepts.
 
         Server ids are opaque hashes (``default_de4d191...``), so a readable name
-        has to be matched against the labels the server reports. The voice list
-        lives on the server, so a cold start has to be up before the lookup is
-        meaningful — otherwise the first synthesis of a session silently falls
-        back to the server's default voice. Warming here is cheap (the health
-        probe is on loopback) and idempotent.
+        has to be matched against the labels the server reports. The list lives on
+        the server, so a cold start can only resolve once one is up.
+
+        ``spawn`` decides who may start the engine. Synthesis paths pass True —
+        they are about to need it, so paying ~2 s here instead of in the audio is
+        correct. Read paths (``default_voice``, a picker paint) MUST pass False:
+        spawning there loads ~3.3 GB of VRAM because some UI asked what the voice
+        is *called*, which is exactly the "engine loads for no reason" behaviour.
+        With False an engine that is down yields None and the caller falls back.
         """
         want = (voice or self.default_voice or "").strip()
         if not want:
             return None
         people = self.voices()
-        if not people:
+        if not people and spawn:
             # Cold engine: no catalogue to match against yet. Bring it up (the
             # caller is about to synthesize anyway) and re-read.
             try:
@@ -1005,11 +1075,19 @@ class EngineSupervisor:
 
     def snapshot(self) -> dict:
         with self._lock:
+            # `self._proc` is only set when THIS object spawned the engine; an
+            # adopted engine (started by a peer, or by hand) has no child handle,
+            # and reporting 0 then made a perfectly live engine look absent to
+            # anything that trusts the pid. Fall back to the owner record.
+            pid = getattr(self._proc, "pid", 0) or 0
+        if not pid:
+            pid = self._engine_owner_pid() or 0
+        with self._lock:
             return {
                 "tts": self.state,
                 "tts_leased": 1 if self._held else 0,
                 "unload_after": self._live("unload_after_seconds", self.unload_after),
-                "pid": getattr(self._proc, "pid", 0) or 0,
+                "pid": pid,
                 "last_error": self.last_error,
                 "endpoint": self.client.base_url,
                 "voice": self.default_voice,
@@ -1147,8 +1225,17 @@ class Zonos3TTS(TTSProvider):
                 for p in self._sup.voices() if p.get("id")]
 
     def default_voice(self) -> Optional[str]:
+        """The configured voice id, resolved without starting the engine.
+
+        A read path: it is called to paint a picker and to fill in a provider's
+        defaults. Resolving a readable name needs the server's catalogue, but
+        ANSWERING that question must never cost a ~2 s start and ~3.3 GB of VRAM
+        — that is how the engine ended up loading when nobody had asked it to
+        speak. With the engine down this returns None and the host falls back to
+        its configured value; synthesis resolves it properly on its own path.
+        """
         if self._sup.default_voice:
-            return self._sup.resolve_voice(self._sup.default_voice)
+            return self._sup.resolve_voice(self._sup.default_voice, spawn=False)
         people = self._sup.voices()
         return people[0].get("id") if people else None
 
