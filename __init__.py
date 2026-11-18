@@ -1713,6 +1713,18 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
                 engine=str(_setting(ctx, "sensevoice_engine", "onnx") or "onnx"),
                 threads=int(_setting(ctx, "sensevoice_threads", 2) or 2),
             )
+            # Preload the recogniser now, in the background. Nothing on the
+            # relay's `/voice/transcribe` path warms a plugin STT provider — the
+            # host's `warm_stt_provider` is a noop for anything outside
+            # {local, local_command}, and the relay never calls the
+            # `audio/stt-lease` endpoint — so without this the FIRST utterance
+            # after the gateway starts pays ~6 s (3 s session + 3 s kernel
+            # warm-up) against ~0.65 s warm. A client that times out reports
+            # "STT didn't work" and the next one succeeds, which reads as
+            # intermittent. Delay a little so plugin registration itself is not
+            # competing with the gateway's startup work.
+            if _bool_setting(ctx, "stt_preload", True):
+                detector.preload(delay=1.5)
             pipeline = EmotionPipeline(
                 detector, provider,
                 enabled=_bool_setting(ctx, "emotion_stt", True),

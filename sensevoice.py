@@ -51,6 +51,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +60,23 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 SR = 16000
+
+
+def _silence_wav(seconds: float = 0.5, rate: int = SR) -> bytes:
+    """A minimal mono 16-bit PCM WAV of silence, for warming a backend.
+
+    Built in-process rather than shelled out to ffmpeg, so a preload has no
+    external dependency and cannot fail on a host without ffmpeg on PATH.
+    """
+    import io
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(rate * max(0.05, float(seconds))))
+    return buf.getvalue()
 N_MELS = 80
 FRAME_LEN = 0.025
 FRAME_SHIFT = 0.010
@@ -497,6 +515,10 @@ class SenseVoiceEmotion:
         self._threads = max(1, int(threads))
         self._use_itn = bool(use_itn)
         self._backend = None
+        # True once a successful warm decode has run (distinguishes "session
+        # built" from "kernels warmed"; only the latter makes the next real call
+        # fast).
+        self._warm_decoded = False
         self._lock = threading.Lock()
         self.last_error = ""
 
@@ -557,6 +579,57 @@ class SenseVoiceEmotion:
         return self._backend
 
     # -- inference --------------------------------------------------------
+    def preload(self, *, delay: float = 0.0) -> None:
+        """Build the inference backend in the background.
+
+        Measured on this host: building the onnxruntime session takes ~3.0 s, and
+        the first decode after it costs another ~3 s (ORT kernel warm-up), so the
+        first utterance in a fresh process takes ~6 s against ~0.65 s warm — a 9x
+        penalty that only the FIRST caller pays.
+
+        That is what makes STT look intermittent on the relay. The relay posts
+        straight to `/voice/transcribe` and nothing on that path warms the engine:
+        the host's own `warm_stt_provider` returns `action: "noop"` for every
+        provider outside `{local, local_command}`, so a plugin STT is never
+        pre-loaded, and the relay never calls the `audio/stt-lease` endpoint at
+        all. A client that gives up after a few seconds reports "STT didn't work"
+        on exactly the first utterance after the gateway has been idle.
+
+        So warm it here, unprompted. Daemon thread, best-effort, never raises: a
+        failed preload must not affect a later real request.
+        """
+        def _go() -> None:
+            if delay:
+                time.sleep(delay)
+            try:
+                if not self.is_available():
+                    return
+                backend = self._get_backend()
+                # Session creation alone leaves the first real decode slow (ORT
+                # builds kernels per input shape on first run), so run one silent
+                # decode through the same frontend. 0.5 s of zeros is enough to
+                # take the shape path without producing a transcript.
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+                        warm_path = fh.name
+                        fh.write(_silence_wav(seconds=0.5))
+                    try:
+                        backend.recognise(Path(warm_path), language=0, ffmpeg=None)
+                        self._warm_decoded = True
+                    finally:
+                        try:
+                            os.unlink(warm_path)
+                        except OSError:
+                            pass
+                except Exception:  # noqa: BLE001 - a partial warm still helps
+                    logger.debug("sensevoice: warm decode skipped", exc_info=True)
+                logger.debug("sensevoice: backend preloaded (%s)", type(backend).__name__)
+            except Exception:  # noqa: BLE001 - warming is an optimisation
+                logger.debug("sensevoice: preload failed", exc_info=True)
+
+        thread = threading.Thread(target=_go, name="sensevoice-preload", daemon=True)
+        thread.start()
+
     def recognise(self, audio_path: str | Path, *, language: int = 0,
                   text_norm: bool = True) -> EmotionResult:
         """Transcribe and detect the speaker's emotion in one pass.
@@ -634,12 +707,14 @@ def make_stt_provider(detector: SenseVoiceEmotion, *, on_result=None,
                 return False
 
         def warm(self) -> None:
-            """Mic opened — build the backend now so the first utterance is warm."""
-            try:
-                if self._det.is_available():
-                    self._det._get_backend()
-            except Exception:  # noqa: BLE001 - warming must never raise
-                logger.debug("sensevoice: warm failed", exc_info=True)
+            """Mic opened — warm the backend so the first utterance is fast.
+
+            Uses the detector THIS provider was built with, not a fresh instance:
+            measured here, warming a separate `SenseVoiceEmotion` had zero effect
+            because the provider holds its own object and re-built the ORT
+            session anyway (6.9 s cold vs 7.1 s "preloaded").
+            """
+            self._det.preload()
 
         def transcribe(self, file_path: str, *, model: Optional[str] = None,
                        language: Optional[str] = None, **extra: Any) -> dict[str, Any]:
