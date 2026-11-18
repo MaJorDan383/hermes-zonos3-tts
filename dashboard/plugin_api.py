@@ -226,6 +226,58 @@ def unload() -> Any:
             "message": "unload requested; the engine stops within a couple of seconds"}
 
 
+@router.post("/stt/unload")
+def stt_unload() -> Any:
+    """Ask the agent process to release the SenseVoice backend.
+
+    Separate from ``/unload`` on purpose: the recogniser is CPU/RAM (~323 MB,
+    0 VRAM) while the voice engine is GPU/VRAM, and wanting one freed says
+    nothing about the other.
+
+    Like ``/unload``, this runs in the dashboard process which does not own the
+    detector, so it hands the request over as a file the owning process consumes.
+    Refused while an STT lease is held: dropping the backend mid-recording would
+    force a ~1.5 s rebuild inside the user's next utterance.
+    """
+    state = _read_state()
+    why = _staleness(state)
+    if why:
+        return JSONResponse({"ok": False, "error": why}, status_code=503)
+
+    stt = state.get("stt") or {}
+    if not stt:
+        return JSONResponse({
+            "ok": False,
+            "error": "the sensevoice STT provider is not registered "
+                     "(set stt_enabled: true and stt.provider: sensevoice)",
+        }, status_code=409)
+
+    if state.get("stt_leased"):
+        return JSONResponse({
+            "ok": False,
+            "error": "a recording surface holds the recogniser; release it first",
+        }, status_code=409)
+
+    if stt.get("loaded") is False:
+        return {"ok": True, "already": True, "message": "the recogniser is not loaded"}
+
+    try:
+        folder = _state_path().parent
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / "_stt_unload_request.json"
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"reason": "manual", "requested_at": time.time()}),
+                       encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception as exc:  # noqa: BLE001 - a UI request must not 500 opaquely
+        return JSONResponse({"ok": False, "error": f"could not queue unload: {exc}"},
+                            status_code=500)
+
+    return {"ok": True, "queued": True,
+            "message": "STT unload requested; the recogniser is released within a "
+                       "couple of seconds"}
+
+
 @router.post("/settings")
 def settings(payload: Dict[str, Any]) -> Any:
     """Persist residency policy into this plugin's settings subtree."""

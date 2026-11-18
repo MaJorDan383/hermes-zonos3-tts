@@ -579,6 +579,10 @@ class SenseVoiceEmotion:
         # built" from "kernels warmed"; only the latter makes the next real call
         # fast).
         self._warm_decoded = False
+        # Guards the background preload so two racing calls cannot build two
+        # sessions (the loser's ORT object would be leaked).
+        self._preloading = False
+        self._preload_lock = threading.Lock()
         self._lock = threading.Lock()
         self.last_error = ""
 
@@ -638,6 +642,30 @@ class SenseVoiceEmotion:
                                              threads=self._threads, use_itn=self._use_itn)
         return self._backend
 
+    # -- lifecycle --------------------------------------------------------
+    def unload(self) -> bool:
+        """Release the inference backend, returning its ~323 MB of RAM.
+
+        SenseVoice holds no VRAM (CPU execution provider only), so this is a RAM
+        trade, not a GPU one: dropping the session frees ~323 MB and costs ~1.5 s
+        to rebuild on the next utterance. `release()` schedules it on the idle
+        timer; this is the manual lever for someone who wants the memory back now.
+
+        Also clears `_warm_decoded`. Leaving it set was a real bug: a later
+        `preload()` then saw "already warmed" and returned without rebuilding, so
+        the recogniser stayed gone while the flags claimed it was ready.
+        """
+        with self._lock:
+            had = self._backend is not None
+            self._backend = None
+            self._warm_decoded = False
+        if had:
+            logger.info("sensevoice: backend released (~323 MB, 0 VRAM)")
+        return had
+
+    def is_loaded(self) -> bool:
+        return self._backend is not None
+
     # -- inference --------------------------------------------------------
     def preload(self, *, delay: float = 0.0) -> None:
         """Build the inference backend in the background.
@@ -661,31 +689,50 @@ class SenseVoiceEmotion:
         def _go() -> None:
             if delay:
                 time.sleep(delay)
-            try:
-                if not self.is_available():
+            if not self.is_available():
+                return
+            # One load at a time: a second preload racing the first would build a
+            # second ORT session, and the loser's object is leaked.
+            with self._preload_lock:
+                if self._preloading:
                     return
+                if self._backend is not None and self._warm_decoded:
+                    return
+                self._preloading = True
+            try:
                 backend = self._get_backend()
+                # If an unload landed while the session was being built, do not
+                # warm-decode into a backend that no longer belongs to us: drop
+                # the reference and let the next call rebuild cleanly.
+                if self._backend is not backend:
+                    logger.debug("sensevoice: preload superseded by an unload")
+                    return
                 # Session creation alone leaves the first real decode slow (ORT
                 # builds kernels per input shape on first run), so run one silent
                 # decode through the same frontend. 0.5 s of zeros is enough to
                 # take the shape path without producing a transcript.
+                warm_path = None
                 try:
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
                         warm_path = fh.name
                         fh.write(_silence_wav(seconds=0.5))
-                    try:
-                        backend.recognise(Path(warm_path), language=0, ffmpeg=None)
-                        self._warm_decoded = True
-                    finally:
+                    backend.recognise(Path(warm_path), language=0, ffmpeg=None)
+                    self._warm_decoded = True
+                    logger.debug("sensevoice: backend preloaded (%s)",
+                                 type(backend).__name__)
+                except Exception:  # noqa: BLE001 - a partial warm still helps
+                    logger.debug("sensevoice: warm decode skipped", exc_info=True)
+                finally:
+                    if warm_path:
                         try:
                             os.unlink(warm_path)
                         except OSError:
                             pass
-                except Exception:  # noqa: BLE001 - a partial warm still helps
-                    logger.debug("sensevoice: warm decode skipped", exc_info=True)
-                logger.debug("sensevoice: backend preloaded (%s)", type(backend).__name__)
             except Exception:  # noqa: BLE001 - warming is an optimisation
                 logger.debug("sensevoice: preload failed", exc_info=True)
+            finally:
+                with self._preload_lock:
+                    self._preloading = False
 
         thread = threading.Thread(target=_go, name="sensevoice-preload", daemon=True)
         thread.start()
@@ -759,6 +806,11 @@ def make_stt_provider(detector: SenseVoiceEmotion, *, on_result=None,
 
         def __init__(self, det: SenseVoiceEmotion):
             self._det = det
+            # Names of surfaces currently holding the recogniser. A SET, mirroring
+            # the host (which adds on every warm and calls release only when the
+            # last holder leaves), so a re-acquire cannot leak a count.
+            self._lease_held: set[str] = set()
+            self._stt_timer: Optional[threading.Timer] = None
 
         def is_available(self) -> bool:
             try:
@@ -773,8 +825,63 @@ def make_stt_provider(detector: SenseVoiceEmotion, *, on_result=None,
             measured here, warming a separate `SenseVoiceEmotion` had zero effect
             because the provider holds its own object and re-built the ORT
             session anyway (6.9 s cold vs 7.1 s "preloaded").
+
+            Hermes runs warm() on EVERY acquire but release() only when the last
+            holder leaves, so the lease is tracked as a set of names here too —
+            a counter would leak one per re-acquire.
+
+            Cancels any armed unload timer first. Without that, a lease taken
+            during the idle window would be torn down moments later by the timer
+            the previous release set — the recogniser would vanish mid-recording.
             """
+            self._lease_held.add("surface")
+            timer = getattr(self, "_stt_timer", None)
+            if timer is not None:
+                timer.cancel()
+                self._stt_timer = None
             self._det.preload()
+
+        def release(self) -> None:
+            """Last STT lease dropped — schedule the idle unload of the backend.
+
+            Independent of TTS: the recogniser is CPU/RAM, the voice engine is
+            GPU/VRAM, and a user may well want one resident without the other.
+            ``stt_unload_after_seconds`` = 0 unloads immediately (see
+            :meth:`_stt_window`); a positive value arms a one-shot timer that the
+            next ``warm()`` cancels.
+            """
+            self._lease_held.clear()
+            window = self._stt_window()
+            cancel = getattr(self, "_stt_timer", None)
+            if cancel is not None:
+                cancel.cancel()
+                self._stt_timer = None
+            if window <= 0:
+                self._det.unload()
+                return
+            timer = threading.Timer(window, self._det.unload)
+            timer.daemon = True
+            self._stt_timer = timer
+            timer.start()
+
+        def _stt_window(self) -> float:
+            try:
+                from hermes_cli.config import load_config_readonly
+                entry = ((load_config_readonly() or {}).get("plugins", {})
+                         .get("entries", {}).get("zonos3-tts", {})
+                         .get("settings", {}) or {})
+                return float(entry.get("stt_unload_after_seconds", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001 - a settings read must not break STT
+                return 0.0
+
+        def unload_now(self) -> bool:
+            """Drop the backend immediately (chip action). True when one was held."""
+            return self._det.unload()
+
+        def status(self) -> dict[str, Any]:
+            return {"loaded": self._det.is_loaded(),
+                    "engine": self._det.engine,
+                    "available": self._det.is_available()}
 
         def transcribe(self, file_path: str, *, model: Optional[str] = None,
                        language: Optional[str] = None, **extra: Any) -> dict[str, Any]:

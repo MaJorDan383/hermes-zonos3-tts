@@ -1836,7 +1836,7 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
     except Exception:  # noqa: BLE001
         pass
 
-    publisher = _StatePublisher(sup, provider, pipeline, ducker)
+    publisher = _StatePublisher(sup, provider, pipeline, ducker, stt_provider)
     sup._publisher = publisher.publish
     publisher.publish(sup)
 
@@ -1885,6 +1885,26 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
             "See the plugin README.", sup.exe, model_dir)
 
 
+def _stt_status(stt: Optional[object]) -> Optional[dict]:
+    """Residency of the STT provider, or None when none is registered.
+
+    Kept as a module function so the publisher does not have to know the STT
+    provider's interface — a plugin that registers a different recogniser simply
+    reports whatever its ``status()`` returns, and one without the method reports
+    presence only instead of raising during telemetry.
+    """
+    if stt is None:
+        return None
+    report = getattr(stt, "status", None)
+    if callable(report):
+        try:
+            value = report()
+            return value if isinstance(value, dict) else {"loaded": None}
+        except Exception:  # noqa: BLE001 - telemetry must never break publishing
+            return {"loaded": None}
+    return {"loaded": None}
+
+
 class _StatePublisher:
     """Publish residency facts to a JSON file the dashboard chip reads.
 
@@ -1895,17 +1915,53 @@ class _StatePublisher:
 
     def __init__(self, sup: EngineSupervisor, provider: Zonos3TTS,
                  pipeline: Optional["EmotionPipeline"] = None,
-                 ducker: Optional[object] = None):
+                 ducker: Optional[object] = None,
+                 stt: Optional[object] = None):
         self.sup = sup
         self.provider = provider
         self.pipeline = pipeline
         self.ducker = ducker
+        # The STT provider, so the chip can report and unload it independently of
+        # the voice engine: the recogniser is CPU/RAM, the engine is GPU/VRAM.
+        self.stt = stt
+
+    def _take_stt_unload(self, out_dir: Path) -> None:
+        """Honour a queued STT-unload request, if one is waiting.
+
+        Claim-by-rename so two publishers cannot both act on it, and skip it
+        entirely when no recogniser is registered (nothing to free).
+        """
+        if self.stt is None:
+            return
+        path = out_dir / "_stt_unload_request.json"
+        try:
+            claim = path.with_suffix(".claimed")
+            os.replace(path, claim)
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        try:
+            claim.unlink()
+        except OSError:
+            pass
+        unload = getattr(self.stt, "unload_now", None)
+        if callable(unload):
+            try:
+                released = unload()
+                logger.info("zonos3-tts: STT unload request honoured (released=%s)",
+                            bool(released))
+            except Exception as exc:  # noqa: BLE001 - telemetry path
+                logger.warning("zonos3-tts: STT unload failed: %s", exc)
 
     def publish(self, _sup: EngineSupervisor) -> None:
         try:
             home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
             out_dir = home / "cache" / "zonos3-tts"
             out_dir.mkdir(parents=True, exist_ok=True)
+            # Consume a queued STT-unload request before snapshotting, so the
+            # published `stt.loaded` already reflects the result of a chip click.
+            self._take_stt_unload(out_dir)
             payload = {
                 **self.sup.snapshot(),
                 "steering_supported": self.provider.steering_supported,
@@ -1918,6 +1974,13 @@ class _StatePublisher:
                 # unanswerable from outside the process that owns the object.
                 "streams_pcm": bool(getattr(self.provider, "streams_pcm", False)),
                 "stream_sample_rate": int(getattr(self.provider, "stream_sample_rate", 0) or 0),
+                # The recogniser is CPU/RAM while the voice engine is GPU/VRAM,
+                # so the chip reports (and unloads) them independently.
+                "stt": _stt_status(self.stt),
+                # True while a recording surface holds an STT lease. The unload
+                # route refuses then, because dropping the backend mid-recording
+                # would force a ~1.5 s rebuild inside the user's next utterance.
+                "stt_leased": bool(getattr(self.stt, "_lease_held", 0)) if self.stt else False,
                 "updated_at": time.time(),
                 "agent_pid": os.getpid(),
             }

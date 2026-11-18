@@ -78,6 +78,8 @@ function ZonosChip({ ctx }) {
   })
   const [busyUnload, setBusy] = useState(false)
   const [unloadError, setError] = useState('')
+  const [busyStt, setBusyStt] = useState(false)
+  const [sttError, setSttError] = useState('')
 
   // Clear a stale refusal as soon as the engine state changes.
   useEffect(() => {
@@ -118,6 +120,27 @@ function ZonosChip({ ctx }) {
       .catch((err) => {
         setBusy(false)
         setError(String((err && err.message) || err || 'unload failed'))
+      })
+  }
+
+  const unloadStt = () => {
+    setBusyStt(true)
+    ctx
+      .rest('/stt/unload', { method: 'POST' })
+      .then(() => {
+        let tries = 0
+        const tick = () => {
+          status.refetch().finally(() => {
+            tries += 1
+            if (tries < 8) window.setTimeout(tick, 700)
+            else setBusyStt(false)
+          })
+        }
+        window.setTimeout(tick, 400)
+      })
+      .catch((err) => {
+        setBusyStt(false)
+        setSttError(String((err && err.message) || err || 'unload failed'))
       })
   }
 
@@ -169,6 +192,12 @@ function ZonosChip({ ctx }) {
                     children: state.streams_pcm
                       ? `Streaming: native ${state.stream_sample_rate} Hz`
                       : 'Streaming: per-sentence (buffered)'
+                  })
+                  : null,
+                state.ok && state.stt
+                  ? jsx('div', {
+                    children: `STT: ${state.stt.loaded ? 'loaded' : 'unloaded'}`
+                      + ` (${state.stt.engine || 'onnx'}, CPU)`
                   })
                   : null,
                 state.ok && state.last_error
@@ -240,6 +269,35 @@ function ZonosChip({ ctx }) {
               : jsx('div', {
                 className: NOTE,
                 children: 'Stops the engine process: reclaims weights, KV cache and CUDA context.'
+              }),
+          jsx(DropdownMenuSeparator, {}),
+          jsx('div', { className: MENU_LABEL, children: 'Speech recognition' }),
+          jsx(DropdownMenuItem, {
+            disabled: busyStt || !state.ok || !state.stt
+              || state.stt.loaded === false || Boolean(state.stt_leased),
+            onSelect: () => unloadStt(),
+            children: [
+              jsx(Codicon, {
+                name: busyStt ? 'sync' : 'debug-stop',
+                spinning: Boolean(busyStt),
+                className: 'mr-2 text-xs'
+              }),
+              busyStt
+                ? 'Releasing…'
+                : state.stt
+                  ? (state.stt.loaded === false ? 'STT not loaded' : 'Unload STT (free RAM)')
+                  : 'STT not registered'
+            ]
+          }),
+          sttError
+            ? jsx('div', { className: NOTE, children: sttError })
+            : state.stt_leased
+              ? jsx('div', { className: NOTE, children: 'A recording surface holds the recogniser.' })
+              : jsx('div', {
+                className: NOTE,
+                children: state.stt
+                  ? 'SenseVoice is CPU-only: this frees ~323 MB RAM, no VRAM. The voice engine stays loaded.'
+                  : 'Enable stt_enabled and set stt.provider: sensevoice to use it.'
               })
         ]
       })

@@ -371,6 +371,41 @@ token's CTC posterior from 0.45–0.95 onto 0–1, calibrated against measured
 real-speech posteriors; below 0.45 is a marginal call. `sherpa` reports the label
 only, so intensity is `None` there rather than a fabricated number.
 
+### STT residency: separate from TTS on purpose
+
+The recogniser and the voice engine are different resources, so they unload
+independently:
+
+| | SenseVoice (STT) | ZONOS3 (TTS) |
+|---|---|---|
+| Where | CPU (`CPUExecutionProvider`) | GPU (CUDA) |
+| Residency cost | **~323 MB RAM, 0 VRAM** | ~3.3 GB VRAM |
+| Rebuild cost | ~1.5 s | ~2 s |
+| Chip action | *Unload STT (free RAM)* | *Unload model now* |
+
+`stt_preload: true` (default) builds the recogniser once at registration, off the
+request path. `stt_unload_after_seconds` (default `600`) decides what happens when
+the last recording surface releases its lease:
+
+- **600** — stay resident for ten minutes, then free the RAM. The default, because
+  323 MB is cheap next to a 1.5 s pause on your next sentence.
+- **0** — unload the instant the mic closes. Correct only if RAM is the binding
+  constraint and you accept the rebuild.
+- a timer armed by `release()` is **cancelled by the next `warm()`**. Without that
+  a lease taken inside the idle window would be torn down mid-recording.
+
+The chip's *Unload STT* button frees it immediately regardless of the window, and
+is refused while a recording surface holds the recogniser (dropping it then would
+force a 1.5 s rebuild inside the user's next utterance). It never touches the voice
+engine, and the voice-engine unload never touches the recogniser.
+
+**Not a quality knob:** raising the sample rate is not offered, because the engine's
+decoder emits 44.1 kHz and only 44.1 kHz (`/v2/generate` has no rate field; every
+candidate name is a 422 on the closed schema). Resampling that to 96 kHz would be a
+larger file carrying the same information — the usable band stays at ~22 kHz.
+Where a higher rate genuinely matters is STT **input**, and that already accepts
+any rate: 44.1k/48k/8k, stereo and 24-bit all decode to the model's fixed 16 kHz.
+
 ### Latency: keep it loaded, skip ffmpeg for WAV
 
 Three measured answers, on this host.
