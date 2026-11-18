@@ -371,6 +371,40 @@ token's CTC posterior from 0.45–0.95 onto 0–1, calibrated against measured
 real-speech posteriors; below 0.45 is a marginal call. `sherpa` reports the label
 only, so intensity is `None` there rather than a fabricated number.
 
+### When the engine is allowed to load
+
+The engine loads for exactly three reasons: read-aloud is on, conversation mode
+is on, or voice mode is active by any other route. Those are the only paths that
+hold a TTS lease, and the lease is what starts it. Nothing else may.
+
+Two rules keep it that way, both learned from real faults:
+
+**A read path never spawns the engine.** Asking *what the voice is called* is not
+asking for speech. `resolve_voice()` therefore takes `spawn=`: synthesis passes
+True (it is about to need the engine, so paying ~2 s up front beats dead air),
+while `default_voice()` and the catalogue reads pass False and degrade to `None`
+when the engine is down. Before this split, `default_voice()` resolved the name
+against the server catalogue and called `ensure_up()` on an empty cache — so a
+repainting picker cost a ~2 s start and ~3.3 GB of VRAM. `voices()` also carries a
+3 s negative cache so a failed probe is not repaid on every repaint.
+
+**Only the owner may stop the engine.** The gateway, dashboard and relay each run
+a supervisor on port 1919 and adopt a server they did not spawn. When the engine
+is spawned its pid is recorded in `_engine_owner.json`, and a peer that unloads
+its own lease leaves the engine alone — otherwise one host dropping its lease
+would kill the engine a peer was mid-sentence on, which presents as "TTS reloads
+constantly". A record naming a *dead* pid is treated as no record, because the
+engine outliving its spawner is normal and must stay unloadable.
+
+### Reading the status chip
+
+Several processes publish `_engine_state.<pid>.json` and they disagree by design:
+a host with nothing loaded reports `{"tts": "idle", "pid": 0}` forever. The reader
+ranks evidence rather than recency — a live engine pid beats a claimed `warm`,
+which beats nothing — and ignores snapshots from exited writers. Picking the
+newest instead made the chip flap `warm → idle → unloaded` while the engine never
+moved.
+
 ### STT residency: separate from TTS on purpose
 
 The recogniser and the voice engine are different resources, so they unload
