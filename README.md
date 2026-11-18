@@ -371,6 +371,38 @@ token's CTC posterior from 0.45–0.95 onto 0–1, calibrated against measured
 real-speech posteriors; below 0.45 is a marginal call. `sherpa` reports the label
 only, so intensity is `None` there rather than a fabricated number.
 
+### Latency: keep it loaded, skip ffmpeg for WAV
+
+Three measured answers, on this host.
+
+**Keep SenseVoice resident — it is not a VRAM question.** The ONNX session is
+CPU-only: `onnxruntime` 1.31.0 here offers only `CPUExecutionProvider` and
+`AzureExecutionProvider`; a GPU run needs `onnxruntime-gpu` plus the cuDNN/CUDA
+runtime DLLs. Keeping it loaded costs **~323 MB of RAM and 0 VRAM**, and saves
+**~2.2 s on the first utterance** and ~0.3 s on each later one. It competes with
+nothing on the GPU, so there is no reason to unload it: `stt_preload: true`
+(default) builds it once, off the request path, at registration.
+
+The cold cost splits in a way that explains the intermittent failures:
+**plugin discovery is ~2.9 s and the model is only ~1.5 s.** Discovery is the
+larger half and it is host code — `_ensure_plugins_discovered()` is called by the
+STT dispatch on first use. The plugin now calls that same public function once at
+registration, so the dispatch path finds it already done. No host change, and a
+failure is logged and ignored (discovery then merely happens later, as before).
+
+**ffmpeg is no longer needed for WAV.** `load_audio` tries, in order: a native
+16 kHz mono PCM WAV via `wave` (~0.3 ms); any other WAV via `soundfile` with a
+NumPy resample (**2.4–9.2 ms** measured, against 55–75 ms for an ffmpeg
+subprocess); then ffmpeg for compressed containers only. On accuracy a linear
+resample is not band-limited and *would* alias music, but for 16 kHz speech
+recognition it was **word-identical to ffmpeg on every line tested** — the only
+differences were commas and question marks. Compressed sources
+(mp3/ogg/flac/m4a/webm/3gp) still go through ffmpeg, and
+`ZONOS3_STT_RESAMPLE=ffmpeg` forces the old path for every format.
+
+So ffmpeg remains **required** for compressed audio and for voice-clip prep, but
+a relay or mic WAV — the common case — no longer shells out at all.
+
 ### Audio ducking (Windows)
 
 Raising the file's loudness stops helping once it is already louder than the

@@ -246,27 +246,61 @@ def _find_ffmpeg() -> Optional[str]:
 def load_audio(path: Path, ffmpeg: Optional[str] = None):
     """``(16000, float32 mono samples)`` for *path*.
 
-    A mono 16-bit **16 kHz** WAV is read directly — that is what the host's own
-    recorder produces (``voice_mode`` writes 16 kHz mono s16 WAV), and it costs
-    ~0.3 ms. Anything else (mp3/ogg/webm, 24-bit, 44.1/48 kHz, stereo) goes
-    through ffmpeg so both backends see identical 16 kHz input; a WAV at another
-    rate is *not* passed through, because the ORT graph is fixed at 16 kHz and
-    sherpa's own resampler would give the two engines slightly different
-    features (and logs a banner to stderr on every call).
+    Fast paths first, in cost order:
 
-    ffmpeg is resolved *after* the fast path, on purpose: ``shutil.which`` here
+    1. a mono 16-bit **16 kHz** WAV is read directly (~0.3 ms) — that is what the
+       host's own recorder produces;
+    2. any WAV **at any rate/channels** is read with ``soundfile`` and resampled in
+       NumPy (~3 ms measured vs ~65 ms for an ffmpeg subprocess);
+    3. everything else (mp3/ogg/webm/3gp…) goes through ffmpeg.
+
+    About (2): the resample is linear interpolation, which is *not* band-limited
+    and would alias a music signal. For 16 kHz speech recognition it measured
+    word-identical to ffmpeg across every line tested (numbers, questions, long
+    sentences) — the only differences were commas and question marks. It is used
+    only for WAV sources, where libsndfile's decoder is exact; compressed
+    containers still go to ffmpeg, and ``resample="ffmpeg"`` forces the old path.
+
+    ffmpeg is resolved *after* the fast paths, on purpose: ``shutil.which`` here
     walks 679 PATH entries (~216 ms measured) and would otherwise be paid on
-    every single utterance in the common case that never needs it.
+    every utterance that never needs it.
     """
     import numpy as np
-    try:
-        with wave.open(str(path), "rb") as w:
-            if (w.getnchannels() == 1 and w.getsampwidth() == 2
-                    and w.getframerate() == SR):
-                raw = w.readframes(w.getnframes())
-                return SR, np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    except (wave.Error, EOFError, OSError):
-        pass  # not a PCM wav: fall through to ffmpeg
+
+    mode = (os.environ.get("ZONOS3_STT_RESAMPLE") or "auto").strip().lower()
+    if mode != "ffmpeg":
+        try:
+            with wave.open(str(path), "rb") as w:
+                ch, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+                if ch == 1 and width == 2 and rate == SR:
+                    raw = w.readframes(w.getnframes())
+                    if raw:
+                        return SR, np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+        except (wave.Error, EOFError, OSError):
+            pass  # not a PCM wav: try soundfile, then ffmpeg
+
+        try:
+            import soundfile as sf
+
+            data = None
+            src_rate = 0
+            with sf.SoundFile(str(path)) as handle:
+                if (handle.format or "").upper() in {"WAV", "WAVEX", "W64"}:
+                    data = handle.read(dtype="float32", always_2d=True)
+                    src_rate = int(handle.samplerate)
+        except Exception:  # noqa: BLE001 - any libsndfile problem -> ffmpeg
+            data = None
+            src_rate = 0
+        if data is not None and len(data) and src_rate > 0:
+            mono = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+            if src_rate == SR:
+                return SR, mono.astype(np.float32)
+            target = int(round(len(mono) * SR / src_rate))
+            if target > 0:
+                resampled = np.interp(
+                    np.linspace(0.0, len(mono) - 1, target),
+                    np.arange(len(mono)), mono).astype(np.float32)
+                return SR, resampled
 
     ffmpeg = ffmpeg or _find_ffmpeg()
     if not ffmpeg:

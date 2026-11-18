@@ -1646,6 +1646,29 @@ def _default_runtime_dir() -> Path:
     return _plugin_root() / "runtime"
 
 
+def _warm_plugin_discovery() -> None:
+    """Run the host's plugin-discovery pass early, off the request path.
+
+    `tools.transcription_command._dispatch_to_plugin_provider` calls
+    `hermes_cli.plugins._ensure_plugins_discovered()` before resolving a plugin
+    STT provider. The FIRST call imports every enabled plugin and measured
+    2.86-3.00 s here — which is why the first relay utterance after a gateway
+    start is the slow (and sometimes failing) one.
+
+    Calling the same public function at registration moves that cost to startup.
+    The call is idempotent and memoised, so the dispatch path later finds it
+    already done. Nothing in the host is patched; a failure is logged and
+    ignored, because discovery happening later is merely the old behaviour.
+    """
+    try:
+        from hermes_cli.plugins import _ensure_plugins_discovered
+        t0 = time.time()
+        _ensure_plugins_discovered()
+        logger.info("zonos3-tts: plugin discovery warmed in %.2f s", time.time() - t0)
+    except Exception as exc:  # noqa: BLE001 - purely an optimisation
+        logger.debug("zonos3-tts: discovery warm failed: %s", exc)
+
+
 def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
     runtime_dir = Path(str(_setting(ctx, "runtime_dir", "") or _default_runtime_dir()))
     model_dir = Path(str(_setting(ctx, "model_dir", "") or
@@ -1725,6 +1748,16 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
             # competing with the gateway's startup work.
             if _bool_setting(ctx, "stt_preload", True):
                 detector.preload(delay=1.5)
+                # Also force plugin discovery in the background. The host's STT
+                # dispatch calls `_ensure_plugins_discovered()` on the first
+                # transcription, and that pass costs 2.9-3.0 s measured — the
+                # single largest piece of the first-utterance latency (it imports
+                # every enabled plugin). Doing it here moves that cost to
+                # registration, while the user is not waiting on a transcript.
+                # Nothing in the host is modified: this is the same function the
+                # dispatch path would call, just called earlier.
+                threading.Thread(target=_warm_plugin_discovery,
+                                 name="zonos3-discovery-warm", daemon=True).start()
             pipeline = EmotionPipeline(
                 detector, provider,
                 enabled=_bool_setting(ctx, "emotion_stt", True),
