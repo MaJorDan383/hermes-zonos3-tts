@@ -1862,8 +1862,8 @@ class Zonos3TTS(TTSProvider):
         (nothing to match, and trimming would only risk clipping a deliberate
         leading pause).
         """
-        if len(parts) <= 1:
-            return _merge_wav(parts)
+        if not parts:
+            return b""
         if not self._seam_smoothing:
             return _merge_wav(parts)
 
@@ -1888,9 +1888,14 @@ class Zonos3TTS(TTSProvider):
             # lands mid-frame. Keep stereo untouched rather than de-interleave
             # for a cosmetic gain — the engine is mono (measured) anyway.
             return _merge_wav(parts)
+        if len(trimmed) == 1:
+            # A single-request reply has no seam, so nothing to level-match — but
+            # it still opens with the engine's ~220 ms pad, which is dead air
+            # before the first word. Trim it.
+            return _parts_to_wav(trimmed, channels, rate)
         matched, gains = _match_levels(trimmed, rate, enabled=self._level_match)
         if self._level_match and any(abs(g) > 0.05 for g in gains):
-            logger.info("zonos3-tts: matched %d chunks to the loudest "
+            logger.info("zonos3-tts: matched %d chunks to the reply median "
                         "(gains %s dB)", len(gains),
                         ", ".join(f"{g:+.1f}" for g in gains))
         return _parts_to_wav(matched, channels, rate)
