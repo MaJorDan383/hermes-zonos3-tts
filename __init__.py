@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import array
@@ -672,6 +673,20 @@ def _merge_wav(parts: list[bytes]) -> bytes:
 # --------------------------------------------------------------------------- engine
 
 
+def _trim_stack(text: str) -> str:
+    """Keep only the frames that say WHO started the engine.
+
+    A full stack is 12 frames of importlib and plugin plumbing; the decision is
+    always within the last few. Dropping the harness noise is what makes the
+    difference between a logged trace nobody reads and a named call site.
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    interesting = [ln for ln in lines
+                   if "zonos3" in ln or "tts" in ln.lower()
+                   or "voice" in ln.lower() or "gateway" in ln.lower()]
+    return "\n".join(interesting[-8:] or lines[-6:])
+
+
 def _pid_running(pid: int) -> bool:
     """True when *pid* names a live process.
 
@@ -853,6 +868,14 @@ class EngineSupervisor:
             raise RuntimeError(
                 f"zonos3-tts: server binary missing at {self.exe}. Build it from "
                 "servers/ggml (plugin README) or set settings.server_exe.")
+        # Record who asked. "The engine loaded at a random time" is unanswerable
+        # from the outside: every surface (read-aloud, conversation, a picker
+        # repaint, a status probe) funnels into this one method, and the state file
+        # only shows the RESULT. The initiating stack turns the next unexplained
+        # start into a named call site instead of a guess.
+        caller = "".join(traceback.format_stack(limit=12)[:-1])
+        logger.info("zonos3-tts: spawning engine; requested by:\n%s",
+                    _trim_stack(caller))
         args = self._argv()
         self._starting = True
         self.state = "starting"
@@ -885,6 +908,11 @@ class EngineSupervisor:
     def ensure_up(self) -> None:
         with self._lock:
             if self.is_up():
+                # Already serving — an adopted engine or a peer's. Record it so
+                # state-based checks (and the idle-timer guards) know it is live.
+                if self.state != "warm":
+                    self.state = "warm"
+                    self.loaded_at = self.loaded_at or time.time()
                 return
             # A concurrent stop is mid-flight; starting a second server now would
             # race it for the port and could leave one orphaned. Wait it out
@@ -902,6 +930,16 @@ class EngineSupervisor:
             if not self._wait_up(time.time() + self.start_timeout):
                 raise RuntimeError(
                     f"zonos3-tts: server not healthy on port {self.port}: {self._log_tail()}")
+            # Listening and healthy means the backbone is resident, so record it.
+            # Leaving the state at "idle" here was a real defect: every later check
+            # that asks "is something running?" believed nothing was, so an engine
+            # brought up by a synthesis restart reported idle while holding 3.3 GB
+            # of VRAM — and the idle-timer guards (which look for warm/starting)
+            # skipped it, leaving it resident forever.
+            with self._lock:
+                if self.state in ("starting", "idle", "unloaded", "error"):
+                    self.state = "warm"
+                    self.loaded_at = time.time()
 
     # -- leases -----------------------------------------------------------
     def warm(self) -> None:
@@ -933,14 +971,29 @@ class EngineSupervisor:
         self._notify()
 
     def release(self) -> None:
-        """The last lease went away: arm the idle stop."""
+        """The last lease went away: arm the idle stop.
+
+        Also arms when there was never a lease to release. An engine can come up
+        without one — a synthesis path that found the server down restarts it, and
+        the host may then never take a lease (a one-shot read-aloud, a tool call) —
+        so `release()` with `_held` False is the only notification this supervisor
+        gets that nothing is using the engine. Returning early there (which this
+        used to do) left such an engine resident with no timer at all: it loaded,
+        and never unloaded. Confirmed by test: `_held=False` after `release()` left
+        `_idle_timer` unarmed.
+        """
         stop_now = False
         with self._lock:
             was_held = self._held
             self._held = False
-            if not was_held:
-                return
             window = self._live("unload_after_seconds", self.unload_after)
+            if not was_held:
+                # No lease to drop — but if something IS running with no holder,
+                # this is the moment to start the idle window.
+                if self.state not in ("warm", "starting") or self._idle_timer is not None:
+                    return
+                logger.debug("zonos3-tts: release() with no lease and a running "
+                             "engine; arming the idle timer (%ss)", window)
             if window <= 0:
                 stop_now = True
             else:
@@ -958,6 +1011,37 @@ class EngineSupervisor:
         if self._idle_timer is not None:
             self._idle_timer.cancel()
             self._idle_timer = None
+
+    def arm_if_orphaned(self) -> bool:
+        """Arm the idle timer for an engine that is running with no lease.
+
+        The last line of defence against "it loaded and stayed loaded". A lease
+        release is the normal trigger for the idle window, but an engine can reach
+        a resident state through a path that never notifies this object: a peer
+        process left it listening, a status/picker read adopted it, or a synthesis
+        restarted it inside a request whose surface then went away without calling
+        release. Whatever the route, the invariant is the same — a resident engine
+        with no holder must be on a timer.
+
+        Called from the heartbeat, so it costs a lock check per tick and only acts
+        in the broken case. Returns True when it armed something.
+        """
+        with self._lock:
+            if self._held or self._idle_timer is not None:
+                return False
+            if self.state not in ("warm", "starting"):
+                return False
+            window = self._live("unload_after_seconds", self.unload_after)
+            if window <= 0:
+                window = 0.001
+            logger.info("zonos3-tts: engine is resident with no lease and no timer; "
+                        "arming the idle stop (%ss)", round(window, 1))
+            t = threading.Timer(window, self._stop_after_idle)
+            t.daemon = True
+            self._idle_timer = t
+            t.start()
+        self._notify()
+        return True
 
     def _stop_after_idle(self) -> None:
         with self._lock:
@@ -2335,6 +2419,9 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
                 if sup.poll_unload_request():
                     publisher.publish(sup)
                     tick = 0
+                # Self-heal: a resident engine with no lease and no timer would
+                # never unload. One lock check per tick; acts only when broken.
+                sup.arm_if_orphaned()
             except Exception:  # noqa: BLE001 - telemetry loop must never die
                 logger.debug("zonos3-tts: unload poll failed", exc_info=True)
             if tick >= 20:

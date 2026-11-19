@@ -502,6 +502,44 @@ source of a dip you can hear over the last word. Left at the engine default
 (`fade_out_ms: null`). Raising it makes the ending noticeably clipped; a large
 value (200+) is what actually fades a line out.
 
+### Why it loaded "at random times"
+
+Two independent causes. The visible one was configuration; the invisible one was a
+lifecycle bug that left engines resident forever.
+
+**`voice.auto_tts_mode` defaults to `"all"`.** With `voice.auto_tts: true` and no
+`auto_tts_mode` set, the gateway auto-speaks *every* reply — including typed ones.
+`gateway/run_voice.py` is the gate:
+
+```python
+if not (voice_mode == "all" or (voice_mode == "voice_only" and is_voice_input)
+        or (voice_mode is None and adapter_auto_tts
+            and (adapter_auto_tts_mode == "all" or is_voice_input))):
+    return False
+```
+
+So a text-only chat still synthesised speech for the log, which loads the engine.
+Set `voice.auto_tts_mode: voice_only` if you only want spoken replies to spoken
+input. Note this is separate from the desktop's Read-aloud toggle
+(`hermes.desktop.autoSpeakReplies` in localStorage) — that one holds a TTS lease
+and is meant to speak typed replies.
+
+**An engine with no lease never got an unload timer.** `release()` returned early
+when `_held` was already False, and `ensure_up()` left the state at `"idle"` even
+after a successful start. Between them, an engine brought up by a synthesis
+restart (or adopted over the socket) could sit at `idle` with 3.3 GB of VRAM and
+no timer — the "it loaded and stayed loaded" shape. Three fixes:
+
+- `ensure_up()` records `warm` on success, including the already-serving path.
+- `release()` arms the idle window for a resident engine even when no lease was
+  held, since that call is the only notification it gets.
+- `arm_if_orphaned()` runs on the heartbeat and arms the timer whenever an engine
+  is resident with no lease and no timer. The invariant: a resident engine with no
+  holder is always on a timer.
+
+Every spawn now also logs the initiating stack, so the next unexplained start
+names its call site instead of leaving it to guesswork.
+
 ### When the engine is allowed to load
 
 The engine loads for exactly three reasons: read-aloud is on, conversation mode
