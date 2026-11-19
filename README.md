@@ -105,9 +105,9 @@ hermes config set plugins.entries.zonos3-tts.settings.unload_after_seconds 300
 | `gpu` | `true` | Pass `--gpu` (CUDA). Set `false` for the CPU backend |
 | `start_timeout_seconds` | `120` | Startup ceiling |
 | `request_timeout_seconds` | `300` | Per-request ceiling |
-| `dynamic_range` | `1.5` | `pitch.pitch_range` — F0 spread width. Safe band ±2; +2 nearly doubles it |
-| `expressive` | `4.0` | `expressive.expressive` — liveliness. Safe band ±8 |
-| `volume_boost` | `2.0` | `delivery.loud` — the engine's only real gain. Safe band 0–4; 4 is clearly louder |
+| `dynamic_range` | `2.0` | `pitch.pitch_range` — **the dynamics lever**: widens F0 spread at constant level (+2 ≈ +65% spread). Safe band ±2 |
+| `expressive` | `0.0` | `expressive.expressive` — buys loudness more than dynamics (+3 dB, contour ~flat). Opt-in |
+| `volume_boost` | `2.0` | `delivery.loud` — the engine's only real gain (+5.6 dB at 2). Safe band 0–4 |
 | `streaming` | `true` | Opt into Hermes' raw-PCM streaming path (native 44100 Hz, float32→int16 in the client) |
 | `steer_hold` | `0.35` | Steer-then-hold: dose multiplier after the onset. `1` = constant push (old behaviour). **Only sent when the live bundle advertises `steer_release`** |
 | `steer_onset_seconds` | `4.0` | Seconds at full dose before the ramp begins |
@@ -375,6 +375,79 @@ artefacts (`Speech`, `Speech_Noise`, `BGM`) never do.
 token's CTC posterior from 0.45–0.95 onto 0–1, calibrated against measured
 real-speech posteriors; below 0.45 is a marginal call. `sherpa` reports the label
 only, so intensity is `None` there rather than a fabricated number.
+
+### Tuning: "a bit more dynamic, not crazy"
+
+The guide (`docs/guide.md`) is explicit about which lever does what, and the two
+are not interchangeable:
+
+> "Livelier readings are also higher and slower in LibriTTS-R, and the direction
+> keeps that; the speaker-embedding `pitch_range` axis widens the spread at a
+> constant F0 level, so it is the cleaner control of the two."
+
+Measured here on a 200-char neutral sentence, three seeds each, octave-corrected
+F0 (P10–P90 span in semitones):
+
+| control | F0 spread | RMS | peak |
+|---|---|---|---|
+| *(neutral)* | 7.6 ±0.4 st | −24.6 | −5.0 |
+| `pitch.pitch_range` 1.0 | 11.8 ±1.3 st | −24.8 | −3.6 |
+| `pitch.pitch_range` 1.5 | 12.9 ±2.7 st | −23.7 | −2.7 |
+| `pitch.pitch_range` **2.0** | **12.5 ±0.5 st** | **−26.9** | −2.3 |
+| `pitch.pitch_range` 2.5 | 14.8 ±0.6 st | −26.8 | −5.2 |
+| `expressive.expressive` 4.0 | 9.8 st | −23.7 | −5.3 |
+| `delivery.loud` 2.0 | 9.3 ±0.4 st | **−19.0** | −2.2 |
+
+**`pitch_range` is the dynamics lever**: at 2.0 it takes the F0 spread from
+7.6 to 12.5 st (+65%) with the level flat. `expressive` and `delivery.loud` mostly
+buy *loudness* — +3 and +5.6 dB respectively, with the contour nearly unchanged.
+Using them for "more dynamic" is what made neutral replies sound emphatic.
+
+Shipped defaults: `dynamic_range: 2.0`, `expressive: 0` (opt-in only),
+`volume_boost: 2.0`.
+
+### Why it used to shout at random
+
+Two separate causes, both measured.
+
+**`mood.valence` + `mood.arousal` stack super-additively.** Neither axis moves
+the level alone, but together they do — the guide's note that the mood directions
+"share one large 'emotional reading vs neutral' component":
+
+| control (3 seeds) | RMS | peak(max) |
+|---|---|---|
+| *(neutral)* | −21.4 | −2.2 |
+| `mood.arousal` 5.5 alone | −21.7 | −1.6 |
+| `mood.arousal` 6.5 alone | −18.2 | −1.2 |
+| `mood.valence` 6.5 alone | −20.9 | −2.6 |
+| **both 6.5 / 5.5** | **−14.8** | **−0.4** |
+
+The old presets put those coordinates on every happy/excited turn, so a
+mis-detected emotion rendered **12–13 dB hot with the peak on the limiter**. That
+is the random yell: an ordinary sentence, delivered at maximum.
+
+The presets no longer send `mood.*` at all. `emotions.*` alone carries the affect
+for 1–2 dB instead of 13.
+
+**Emotion doses were uncapped.** Even with the mood coordinates gone, a full-dose
+emotion stacked on the always-on prosody reached −0.5 dBFS (the limiter).
+`_EMOTION_MAX_DOSE = 0.7` clamps whatever intensity arrives:
+
+| turn | peak before cap | peak after |
+|---|---|---|
+| neutral | −1.5 | −1.5 |
+| happy | **−0.5** | −2.4 |
+| excited | −1.7 | −2.4 |
+| angry | −1.1 | −1.8 |
+
+The cap matters as much for *wrong* detections as right ones: SenseVoice labels a
+lot of ordinary speech "happy", so a dose that stays pleasant when it is wrong
+beats maximum expression when it is right. Intensity above 0.7 is clamped rather
+than scaled, so `2.0` no longer means "twice as loud".
+
+**Want the old behaviour back?** Set `dynamic_range`, `expressive` and
+`volume_boost` as you like, and pass the mood pad explicitly via `controls` — e.g.
+`{"mood.valence": 6.5, "mood.arousal": 5.5}` — but expect it to be loud.
 
 ### Why the volume dipped between sentences, and what fixes it
 

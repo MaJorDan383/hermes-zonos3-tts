@@ -90,16 +90,38 @@ _DEFAULT_REQUEST_TIMEOUT = 300.0
 _DEFAULT_RETRY_ATTEMPTS = 3
 
 # -- prosody defaults -------------------------------------------------------
-# Always-on shaping, applied to every utterance regardless of detected emotion.
-# Measured on this host against a baseline F0 spread of 3.17 semitones:
-#   pitch.pitch_range +2 -> 5.93 st (near double: the strongest single lever)
-#   expressive.expressive +16 -> 4.25 st
-#   delivery.loud 4 -> +4.7 dB peak / +6.8 dB RMS (the engine's only real gain;
-#   mood.loudness measured -2.2 dB peak and is deliberately unused)
-# Defaults stay modest — audible lift without pushing a voice off its identity.
-_DEFAULT_DYNAMIC_RANGE = 1.5     # pitch.pitch_range, safe band ±2
-_DEFAULT_EXPRESSIVE = 4.0        # expressive.expressive, safe band ±8
-_DEFAULT_VOLUME_BOOST = 2.0      # delivery.loud, safe band 0-4
+# The docs' own advice (guide.md, "Expressiveness in hidden space"):
+#
+#   "Livelier readings are also higher and slower ... and the direction keeps
+#    that; the speaker-embedding `pitch_range` axis widens the spread at a
+#    constant F0 level, so it is the cleaner control of the two."
+#
+# Measured here on a 200-char neutral sentence, 3 seeds each, octave-corrected
+# F0 (P10-P90 span). "More dynamic" means spread up with the level flat:
+#
+#   control             F0 spread        RMS      peak
+#   (neutral)         7.6 +/-0.4 st    -24.6     -5.0
+#   pitch_range 1.0  11.8 +/-1.3 st    -24.8     -3.6
+#   pitch_range 1.5  12.9 +/-2.7 st    -23.7     -2.7
+#   pitch_range 2.0  12.5 +/-0.5 st    -26.9     -2.3
+#   pitch_range 2.5  14.8 +/-0.6 st    -26.8     -5.2
+#   expressive 4.0    9.8 st          -23.7*    -5.3   (+3 dB, little spread)
+#   delivery.loud 2   9.3 +/-0.4 st   -19.0     -2.2   (+5.6 dB: gain, not dynamics)
+#
+# pitch_range is the only lever that widens the contour without pushing the level
+# — 2.0 takes the spread from 7.6 to 12.5 st (+65%) with RMS flat. `expressive`
+# and `delivery.loud` mostly buy loudness, which is what made neutral replies
+# sound emphatic, so `expressive` is off and the boost stays modest.
+_DEFAULT_DYNAMIC_RANGE = 2.0     # pitch.pitch_range: "a bit more dynamic", not theatrical
+_DEFAULT_EXPRESSIVE = 0.0        # expressive.expressive — loudness, not dynamics; opt-in only
+_DEFAULT_VOLUME_BOOST = 2.0      # delivery.loud, safe band 0-4; the engine's only real gain
+
+# Ceiling on how far an emotion may push, whatever intensity arrives. Detection
+# over-fires and the emotions stack on top of the always-on prosody, so this is a
+# safety rail, not a taste setting: at 1.0 a happy turn peaked at -0.5 dBFS (the
+# limiter); at 0.7 it centres near -2.2 dBFS and stays a colouring rather than a
+# shout. See emotion_controls().
+_EMOTION_MAX_DOSE = 0.7
 
 # Steer-then-hold. A constant hidden-space push integrates over a long line: the
 # model copies the style of speech it has already produced, so stacked liveliness
@@ -144,18 +166,39 @@ _ENGINE_FIELDS = frozenset({
 # GET /v2/controls on a live server (bundle `studio_mect60k_x10`).
 #
 # `emotions.*` and `delivery.*` take a dose (1.0 = the bundle's nominal step,
-# negative reverses). `mood.*` takes an absolute 0-8 coordinate, so it is
-# interpolated from neutral by intensity rather than scaled.
+# negative reverses).
+#
+# DELIBERATELY NO `mood.valence` / `mood.arousal` HERE. Those are the loudest
+# thing in the bundle and they stack super-additively with each other. Measured
+# on a neutral 95-char sentence, three seeds each:
+#
+#   control                     RMS      peak(max)
+#   (neutral)                 -21.4 dB    -2.2
+#   mood.arousal 5.5 alone    -21.7 dB    -1.6
+#   mood.arousal 6.5 alone    -18.2 dB    -1.2
+#   mood.valence 6.5 alone    -20.9 dB    -2.6
+#   BOTH 6.5 / 5.5            -14.8 dB    -0.4   <- +6.6 dB, pinned to the limiter
+#
+# Neither axis alone moves the level, but together they do — which is what the
+# guide means by "the directions share one large 'emotional reading vs neutral'
+# component". At the old presets a happy or excited turn rendered 12-13 dB hot
+# against a neutral baseline with its peak on 0 dBFS, and that is the "random
+# yelling / dramatic exclamation" coming out of sentences that had nothing
+# dramatic in them: a mis-detected emotion was switching those coordinates on.
+#
+# `emotions.*` alone carries the affect (it costs ~1-2 dB, not 13) so the
+# expression survives without the shout. If you want the full mood-pad
+# behaviour back, add the coordinates explicitly via `controls` — but expect it
+# to be loud.
 EMOTION_CONTROLS: dict[str, dict[str, float]] = {
     "neutral":   {},
-    "happy":     {"emotions.happy": 1.6, "mood.valence": 6.5, "mood.arousal": 5.5},
-    "excited":   {"emotions.happy": 2.0, "emotions.ecstatic": 1.2,
-                  "mood.arousal": 7.0, "delivery.tempo": 1.5},
-    "sad":       {"emotions.sad": 1.6, "mood.valence": 2.5, "mood.arousal": 3.0},
-    "angry":     {"emotions.angry": 1.8, "mood.arousal": 6.5, "delivery.loud": 1.0},
-    "fearful":   {"emotions.fearful": 1.5, "mood.arousal": 6.5, "mood.valence": 3.0},
-    "surprised": {"emotions.surprised": 1.5, "mood.arousal": 6.0},
-    "disgusted": {"emotions.disgusted": 1.4, "mood.valence": 2.8},
+    "happy":     {"emotions.happy": 1.0},
+    "excited":   {"emotions.happy": 1.2, "emotions.ecstatic": 0.6, "delivery.tempo": 1.0},
+    "sad":       {"emotions.sad": 1.2},
+    "angry":     {"emotions.angry": 1.2},
+    "fearful":   {"emotions.fearful": 1.0},
+    "surprised": {"emotions.surprised": 1.0},
+    "disgusted": {"emotions.disgusted": 1.0},
 }
 
 _MOOD_KEYS = frozenset({"mood.valence", "mood.arousal", "mood.dominance",
@@ -172,12 +215,22 @@ def emotion_controls(emotion: Optional[str], intensity: float = 1.0) -> dict[str
     *intensity* (0-2) blends between neutral and full expression. Unknown labels
     return ``{}`` — an unrecognised emotion must never break speech, and neutral
     sends no controls at all so the engine uses its own defaults.
+
+    The result is capped at ``_EMOTION_MAX_DOSE``. Full dose on top of the always-on
+    prosody stack drove the peak to -0.5 dBFS on a happy turn against -1.5 for
+    neutral — i.e. into the engine's limiter, which is heard as a shout. At 0.7 the
+    same turn centres around -2.2 dBFS: still audibly different from neutral, with
+    headroom left for the realisation peaks that actually carry emotion. Detection
+    also over-fires (SenseVoice calls plenty of ordinary speech "happy"), so a dose
+    that stays pleasant when it is WRONG matters more than maximum expression when
+    it is right.
     """
     key = (emotion or "neutral").strip().lower()
     spec = EMOTION_CONTROLS.get(key) or {}
     t = max(0.0, min(2.0, float(intensity)))
     if not spec or t <= 0:
         return {}
+    t = min(t, _EMOTION_MAX_DOSE)
     out: dict[str, float] = {}
     for name, value in spec.items():
         if name in _MOOD_KEYS:
