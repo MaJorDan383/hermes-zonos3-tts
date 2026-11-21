@@ -1095,6 +1095,13 @@ class EngineSupervisor:
         """Consume a pending request. True when one was waiting.
 
         Rename-then-delete so two readers cannot both act on one request.
+
+        Every process hosting this plugin runs the heartbeat, and any of them can
+        claim the file — including hosts that adopted the engine and cannot stop
+        it. When such a host wins the race it deleted the request and did nothing,
+        so the button silently did nothing and the chip showed the state a moment
+        later. The request now carries no owner, and the claimer either acts or
+        puts it back for a host that can.
         """
         path = self._request_dir() / self._UNLOAD_REQUEST
         try:
@@ -1105,11 +1112,43 @@ class EngineSupervisor:
         except OSError as exc:
             logger.debug("zonos3-tts: unload request unreadable: %s", exc)
             return False
+        if not self._can_stop_engine():
+            # Cannot honour it here: restore the request for a host that can,
+            # rather than swallowing the user's click.
+            logger.debug("zonos3-tts: unload request left for the engine's owner")
+            try:
+                os.replace(claim, path)
+            except OSError:
+                pass
+            return False
         try:
             claim.unlink()
         except OSError:
             pass
         return True
+
+    def _can_stop_engine(self) -> bool:
+        """Whether this object may actually terminate the running engine.
+
+        True when it spawned the engine (a child handle it can signal), or when the
+        ownership record names this process, or when the recorded owner is DEAD.
+
+        The dead-owner case is the one that matters in practice: the engine
+        outlives the process that spawned it — that is deliberate, so a restart
+        does not pay a cold start — and after such a restart the record names a pid
+        that no longer exists. Refusing there left the engine permanently
+        un-unloadable, since the only process entitled to stop it was gone. A
+        live peer is still respected; an absent one is not.
+        """
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            return True
+        owner = self._engine_owner_pid()
+        if owner is None:
+            # No usable record (unreadable, stale, or engine down). Fall back to
+            # "may stop" when the engine is genuinely up, so an orphan is fixable.
+            return self.is_up()
+        return owner == os.getpid()
 
     def poll_unload_request(self) -> bool:
         """Act on a pending manual unload. Returns True when one was honoured."""
@@ -1161,16 +1200,47 @@ class EngineSupervisor:
         return pid
 
     def _record_owner(self) -> None:
-        """Claim the running engine for this process."""
+        """Claim the running engine for this process, and record which process it IS.
+
+        Two different pids, and conflating them was a real bug: ``owner_pid`` is
+        who may stop the engine (the spawner), while ``engine_pid`` is the server
+        process itself. ``_record_owner`` used to write only the former, and
+        ``snapshot()`` fell back to it for the published ``pid`` — so every peer
+        that adopted the engine published the GATEWAY's pid as though the engine
+        were running at that pid. The chip then judged liveness against the
+        gateway (always alive) instead of the engine, which is how an unloaded
+        engine kept being reported as loaded and vice versa.
+        """
+        engine_pid = getattr(self._proc, "pid", 0) or 0
         try:
             target = self._owner_file()
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(json.dumps({"owner_pid": os.getpid(),
+                                       "engine_pid": engine_pid,
                                        "port": self.port,
                                        "at": time.time()}), encoding="utf-8")
             os.replace(tmp, target)
         except Exception as exc:  # noqa: BLE001 - a missing record is survivable
             logger.debug("zonos3-tts: could not record engine ownership: %s", exc)
+
+    def _engine_pid(self) -> int:
+        """Pid of the running server process, or 0 when it is not running.
+
+        Read from the owner record when this object did not spawn the engine (it
+        adopted a peer's or a leftover one). Verified against actual liveness, so
+        a fossil record cannot make a dead engine look resident.
+        """
+        own = getattr(self._proc, "pid", 0) or 0
+        if own and _pid_running(own):
+            return own
+        try:
+            data = json.loads(self._owner_file().read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return 0
+        pid = data.get("engine_pid")
+        if isinstance(pid, int) and pid > 0 and _pid_running(pid):
+            return pid
+        return 0
 
     def _stop_orphan_engine(self) -> bool:
         """Stop an engine this object did not spawn. True when a process was stopped.
@@ -1411,16 +1481,21 @@ class EngineSupervisor:
 
     def snapshot(self) -> dict:
         with self._lock:
+            state = self.state
             # `self._proc` is only set when THIS object spawned the engine; an
-            # adopted engine (started by a peer, or by hand) has no child handle,
-            # and reporting 0 then made a perfectly live engine look absent to
-            # anything that trusts the pid. Fall back to the owner record.
-            pid = getattr(self._proc, "pid", 0) or 0
-        if not pid:
-            pid = self._engine_owner_pid() or 0
-        with self._lock:
+            # adopted engine (started by a peer, or by hand) has no child handle.
+            # `_engine_pid()` resolves both cases and verifies liveness, so the
+            # published pid is the SERVER's, never the spawning process's.
+            pid = self._engine_pid()
+            if not pid and state == "warm":
+                # Nothing is actually running, so claiming "warm" would be a lie
+                # and would freeze the chip on a stale state.
+                state = "unloaded"
+            elif pid and state in ("idle", "unloaded"):
+                # Something IS running, so report that rather than the opinion.
+                state = "warm"
             return {
-                "tts": self.state,
+                "tts": state,
                 "tts_leased": 1 if self._held else 0,
                 "unload_after": self._live("unload_after_seconds", self.unload_after),
                 "pid": pid,

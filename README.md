@@ -565,6 +565,43 @@ would kill the engine a peer was mid-sentence on, which presents as "TTS reloads
 constantly". A record naming a *dead* pid is treated as no record, because the
 engine outliving its spawner is normal and must stay unloadable.
 
+### The unload button and the status chip
+
+The chip reads a snapshot several processes publish, so it is treated as a **hint**
+and reconciled against the OS before display:
+
+- `_query_engine_pids()` asks `tasklist` for the server image and returns the real
+  pids. `_engine_running()` answers "is anything resident" without trusting a
+  writer, and `_is_engine_process(pid)` checks the image name, not mere liveness.
+- `GET /status` overwrites a snapshot's `tts`/`pid` with that truth, so the chip
+  cannot show a stale "loaded" or a stale "unloaded".
+
+Three bugs made the button look broken:
+
+**The published pid was the spawner's, not the engine's.** `_record_owner()` wrote
+only `owner_pid` (who may stop the engine), and `snapshot()` fell back to it for the
+published `pid`. Every peer that adopted the engine therefore advertised the
+**gateway's** pid as the resident engine — and since the gateway is always alive,
+that snapshot outranked all others in the reader's evidence ranking forever. The
+record now carries `engine_pid` too, and `_engine_pid()` verifies it with a real
+liveness check.
+
+**Any host could swallow the request.** Every process hosting the plugin runs the
+heartbeat, and `_take_unload_request()` let any of them claim the file by rename —
+including hosts that adopted the engine and cannot stop it. Such a host deleted the
+request and did nothing. A claimer now checks `_can_stop_engine()` first and
+**puts the request back** for a host that can honour it.
+
+**A dead owner made the engine un-unloadable.** The engine deliberately outlives its
+spawner, so after a gateway restart the ownership record names a pid that no longer
+exists. Refusing to stop in that case left the engine permanently stuck. A dead
+owner now counts as "may stop"; a live peer is still respected.
+
+Verified end to end: engine pid ≠ host pid in the record; `/status` reports loaded
+with the engine pid; a live non-engine pid is not treated as resident; a peer
+leaves the request in place while the owner honours it; a dead owner can still
+unload; and an idle unload really frees the process. See `tests_regress.py`.
+
 ### Reading the status chip
 
 Several processes publish `_engine_state.<pid>.json` and they disagree by design:

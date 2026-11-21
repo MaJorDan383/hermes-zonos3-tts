@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -84,12 +85,19 @@ def _read_state() -> Dict[str, Any]:
             engine_pid = int(state.get("pid") or 0)
         except (TypeError, ValueError):
             engine_pid = 0
-        # Evidence outranks opinion, in tiers: a live engine pid is proof; "warm"
-        # with pid 0 is an adopted engine (real, but unverifiable here); anything
-        # else is a writer with nothing loaded. Recency breaks ties per tier.
-        if engine_pid > 0 and _pid_alive(engine_pid):
+        # Evidence outranks opinion, in tiers. A snapshot whose `pid` is a LIVE
+        # ENGINE PROCESS is proof the engine was resident when it was written; a
+        # claimed `warm` is next; anything else is a writer with nothing loaded.
+        # Recency breaks ties per tier.
+        #
+        # Crucial: the pid must be the SERVER's. A writer that published its own
+        # pid in that field (the pre-v1.16.1 bug) would look like live evidence
+        # forever, which is what let an unloaded engine keep reading as loaded.
+        # `_is_engine_process` checks the image name, so a host's own pid can
+        # never masquerade as a resident engine.
+        if engine_pid > 0 and _is_engine_process(engine_pid):
             evidence = 2.0
-        elif state.get("tts") == "warm":
+        elif state.get("tts") == "warm" and _engine_running():
             evidence = 1.0
         else:
             evidence = 0.0
@@ -97,6 +105,57 @@ def _read_state() -> Dict[str, Any]:
         if key > best_key:
             best, best_key = state, key
     return best
+
+
+def _engine_image() -> str:
+    """The server image name, from the plugin declaration (name, not a guess)."""
+    return "zonos3-server.exe"
+
+
+def _query_engine_pids() -> set[int]:
+    """Pids whose image is the TTS server, or an empty set when the query fails."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {_engine_image()}",
+             "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdin=subprocess.DEVNULL).stdout or ""
+    except Exception:  # noqa: BLE001 - a failed probe reports "not running"
+        return set()
+    pids: set[int] = set()
+    for line in out.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower() == _engine_image():
+            try:
+                pids.add(int(parts[1]))
+            except ValueError:
+                pass
+    return pids
+
+
+def _engine_running() -> bool:
+    """True when a TTS server process exists on this host.
+
+    Ground truth for the telemetry: a snapshot is one process's opinion, and
+    several processes publish. Asking the OS settles whether the engine is
+    resident without trusting any writer.
+    """
+    return bool(_query_engine_pids())
+
+
+def _is_engine_process(pid: Any) -> bool:
+    """True when *pid* is a live TTS server.
+
+    Stricter than "the pid exists", which is what made this class of bug possible:
+    a host publishing its OWN pid looked like a resident engine because that pid
+    was alive. Matching the image means only the real server counts.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    return pid > 0 and pid in _query_engine_pids()
 
 
 def _pid_alive(pid: Any) -> bool:
@@ -151,10 +210,28 @@ def _staleness(state: Dict[str, Any]) -> str:
 
 @router.get("/status")
 def status() -> Dict[str, Any]:
+    """Residency for the chip: the writers' snapshot, corrected by the OS.
+
+    The snapshot is one process's opinion and several processes publish, so its
+    `tts`/`pid` are treated as a hint and reconciled against reality here. Without
+    this the chip could show "loaded" for a stopped engine (or the reverse) purely
+    because a different writer won the last race.
+    """
     state = _read_state()
     why = _staleness(state)
     if why:
         return {"ok": False, "reason": why}
+    pids = _query_engine_pids()
+    reported = state.get("pid")
+    try:
+        reported = int(reported or 0)
+    except (TypeError, ValueError):
+        reported = 0
+    running = bool(pids)
+    if running:
+        state = {**state, "tts": "warm", "pid": reported if reported in pids else min(pids)}
+    else:
+        state = {**state, "tts": "unloaded", "pid": 0}
     return {"ok": True, **state}
 
 
