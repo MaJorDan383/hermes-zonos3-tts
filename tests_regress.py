@@ -57,6 +57,66 @@ for name in ("Savannah", "Imogen", "Wyatt"):
     check(f"resolve {name}", bool(sup.resolve_voice(name)))
 check("unknown voice -> None", sup.resolve_voice("NotARealVoice") is None)
 
+print("\n== silence must not become a spoken turn ==")
+# The bug this guards: SenseVoice has no no-speech output, so a muted mic decoded
+# to a confident `我.` and it was delivered as a user message. The gate refuses
+# the clip; an explicit language hint never suppressed it.
+import tempfile as _tf
+import wave as _wave
+
+_sv = sys.modules.get("zonos3-tts.sensevoice") or __import__("sensevoice")
+
+
+def _write_wav(samples, rate=16000):
+    fh = _tf.NamedTemporaryFile(suffix=".wav", delete=False)
+    fh.close()
+    with _wave.open(fh.name, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(np.clip(np.asarray(samples) * 32768.0, -32768, 32767)
+                      .astype(np.int16).tobytes())
+    return fh.name
+
+
+try:
+    _det = _sv.SenseVoiceEmotion()
+    if _det.is_available():
+        _probes = []
+        for _amp in (0, 100, 3000):
+            _probes.append((f"noise{_amp}", np.random.randn(32000) * _amp / 32768.0))
+        _probes.append(("zeros", np.zeros(32000)))
+        for _name, _arr in _probes:
+            _f = _write_wav(_arr)
+            try:
+                _r = _det.recognise(_f, language=2)  # `en` hint, which never helped
+            finally:
+                os.unlink(_f)
+            check(f"{_name} reads as no speech", _r.no_speech and not _r.text,
+                  f"no_speech={_r.no_speech} text={_r.text!r}")
+
+        # The gate must not be so eager that it eats real utterances. A pure tone
+        # burst has speech-like level modulation, unlike stationary noise.
+        _t = np.arange(16000 * 2) / 16000
+        _tone = 0.3 * np.sin(2 * np.pi * 180 * _t) * np.exp(-((_t % 0.5) ** 2) / 0.02)
+        _f = _write_wav(_tone)
+        try:
+            check("a modulated tone is not classified as silence",
+                  _sv._looks_like_speech(_tone.astype(np.float32)))
+        finally:
+            os.unlink(_f)
+    else:
+        print("  SKIP  sensevoice weights unavailable")
+
+        # The gate itself is pure signal processing; still assert the decision on
+        # synthetic input so the thresholds cannot silently invert.
+        _t = np.arange(16000 * 2) / 16000
+        _speechy = 0.3 * np.sin(2 * np.pi * 180 * _t) * np.exp(-((_t % 0.5) ** 2) / 0.02)
+        check("stationary noise is speechless", not _sv._looks_like_speech(np.zeros(32000)))
+        check("modulated tone is not speechless", _sv._looks_like_speech(_speechy.astype(np.float32)))
+finally:
+    pass
+
 print("\n== buffered synthesis ==")
 out = Path(os.environ["TMPDIR"]) / "zreg_out.wav"
 prov.synthesize("The quick brown fox jumps over the lazy dog.", str(out), voice="Savannah")

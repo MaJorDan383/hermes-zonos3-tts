@@ -112,6 +112,33 @@ _AUDIO_EVENTS = ("Speech", "BGM", "Laughter", "Applause", "Cry", "Sneeze",
 # Short alpha control tokens that are normalisation hints, not language tags.
 _NON_LANGUAGE_TAGS = {"woitn", "withitn"}
 
+# -- speech-presence gate ---------------------------------------------------
+# SenseVoice is a CTC model with no "no speech" output. Fed near-silence or
+# noise it emits one confident token — measured here, digital silence decodes to
+# ``我.`` and white noise to ``그.`` — and an explicit language id does not stop
+# it (``language=en`` still returned ``我.``), so the hint is not the fix. Without
+# a gate that ghost token becomes a user turn.
+#
+# A VAD model would mean another download; these two statistics over the raw
+# samples separate the populations with no extra dependency because speech
+# modulates level over time while noise does not. Measured on this host:
+#
+#   real speech   p95-p10 frame level 1.7..226 dB, active-frame flatness 0.05..0.72
+#   silence/noise p95-p10 frame level 0.0..1.3 dB, active-frame flatness 0.84..1.00
+#
+# Both statistics must call the clip speechless before it is dropped, so a quiet
+# or very short real utterance cannot be lost to a single bad number; the levels
+# above are unchanged by attenuation (a real clip 60 dB down keeps its range).
+#
+# Flatness is measured over *active* frames (within ACTIVE_LEVEL_DB of the
+# loudest). Over the whole clip it is useless: 3 s of trailing silence makes a
+# real recording read 1.000, and 2 s of leading silence drags it to 0.67 — the
+# padding, not the speech, dominating the median. Restricting to loud frames is
+# what makes one number describe the speech itself.
+_SPEECH_MIN_RANGE_DB = 3.0
+_SPEECH_MAX_FLATNESS = 0.78
+ACTIVE_LEVEL_DB = 30.0
+
 # Decoding threads. Measured on this host (i7-12700K, 12C/20T, int8 ONNX): 2
 # threads is the sweet spot — a 3 s clip in 414 ms vs 1028 ms at 1 thread and
 # 867 ms at 4. More threads oversubscribe the P/E split and lose badly.
@@ -136,6 +163,10 @@ class EmotionResult:
     # opinion" and "calm" are different evidence, and only the second should
     # steer a reply. `emotion` stays "neutral" so lookups still resolve.
     detected: bool = True
+    # True when the audio carries no speech at all, so ``text`` is empty because
+    # there was nothing to hear — not because recognition failed. Distinguishing
+    # it matters: callers re-listen quietly on no-speech but surface a real error.
+    no_speech: bool = False
 
     @property
     def ok(self) -> bool:
@@ -183,6 +214,48 @@ def _mel_filterbank(n_mels: int = N_MELS, n_fft: int = N_FFT, sr: int = SR,
         if right > centre:
             fb[i, centre:right] = (right - np.arange(centre, right)) / (right - centre)
     return fb
+
+
+def _looks_like_speech(samples) -> bool:
+    """True when *samples* carry something speech-shaped; False for silence/noise.
+
+    The alternative — trusting the decode — is what produced ``我.`` from a muted
+    mic, because SenseVoice has no no-speech token and its CTC head puts a whole
+    softmax on one arbitrary token per blank frame. Two cheap statistics over the
+    raw signal decide instead, and the clip is only called speechless when BOTH
+    agree, so a single quirky measurement cannot eat a real utterance:
+
+    * **Frame-level range** (p95-p10 of 25 ms RMS): speech opens and closes the
+      vocal tract, so level swings by tens of dB. Stationary noise, including
+      digital silence, is flat within ~1.4 dB.
+    * **Spectral flatness** (geometric/arithmetic mean per frame, medianed over
+      the active frames): voiced speech concentrates energy into formants
+      (0.05..0.72 measured), while noise spreads it evenly across bins
+      (0.84..1.00).
+
+    Length is not a gate: the level statistics are computed over whatever frames
+    exist, and a short real utterance keeps a wide range.
+    """
+    import numpy as np
+
+    x = np.asarray(samples, dtype=np.float32).ravel()
+    frame_len = int(FRAME_LEN * SR)
+    shift = int(FRAME_SHIFT * SR)
+    if x.size < frame_len:
+        return False  # too short to hold a 25 ms frame, let alone a word
+    n_frames = 1 + (x.size - frame_len) // shift
+    idx = np.arange(frame_len)[None, :] + shift * np.arange(n_frames)[:, None]
+    frames = x[idx] * np.hamming(frame_len)[None, :]
+
+    level_db = 20.0 * np.log10(np.sqrt(np.mean(frames ** 2, axis=1)) + 1e-12)
+    level_range = float(np.percentile(level_db, 95) - np.percentile(level_db, 10))
+
+    spectrum = np.abs(np.fft.rfft(frames, axis=1)) + 1e-12
+    flatness = np.exp(np.mean(np.log(spectrum), axis=1)) / np.mean(spectrum, axis=1)
+    active = level_db >= level_db.max() - ACTIVE_LEVEL_DB
+    median_flatness = float(np.median(flatness[active])) if active.any() else 1.0
+
+    return level_range >= _SPEECH_MIN_RANGE_DB and median_flatness <= _SPEECH_MAX_FLATNESS
 
 
 def _fbank(x):
@@ -436,6 +509,10 @@ class _SherpaBackend:
 
     def recognise(self, path: Path, *, language: int = 0, ffmpeg: Optional[str] = None) -> EmotionResult:
         rate, samples = load_audio(path, ffmpeg)
+        if not _looks_like_speech(samples):
+            logger.debug("sensevoice: no speech in %.2fs of audio; skipping decode",
+                         samples.size / SR)
+            return EmotionResult(no_speech=True)
         with self._lock:  # one recognizer, one utterance at a time
             stream = self._rec.create_stream()
             stream.accept_waveform(rate, samples)
@@ -476,6 +553,14 @@ class _OnnxBackend:
             raise RuntimeError(f"expected {SR} Hz audio, got {rate} Hz")
         if samples.size == 0:
             raise RuntimeError("audio decoded to zero samples")
+        # SenseVoice has no no-speech output: on silence its CTC head emits one
+        # arbitrary but confident token. Refuse the clip before it can become a
+        # user turn — the ghost token would otherwise read as something the
+        # speaker said (`我.` from a muted mic).
+        if not _looks_like_speech(samples):
+            logger.debug("sensevoice: no speech in %.2fs of audio; skipping decode",
+                         samples.size / SR)
+            return EmotionResult(no_speech=True)
         feat = _apply_lfr(_fbank(samples))
         with self._lock:
             logits = self._session.run(None, {
@@ -889,6 +974,12 @@ def make_stt_provider(detector: SenseVoiceEmotion, *, on_result=None,
             if not result.ok:
                 return {"success": False, "transcript": "", "provider": self.name,
                         "error": result.error}
+            if result.no_speech:
+                # Heard nothing, which is not a failure: the host re-listens quietly
+                # instead of showing "Transcription failed". Same envelope the
+                # built-in providers use for silence.
+                return {"success": True, "transcript": "", "provider": self.name,
+                        "no_speech": True}
             if on_result is not None:
                 try:
                     on_result(result)
