@@ -692,19 +692,19 @@ def _trim_stack(text: str) -> str:
     return "\n".join(interesting[-8:] or lines[-6:])
 
 
-def _engine_parent_pid() -> Optional[int]:
-    """Pid of the process that actually parented the running engine, or None.
+def _engine_processes(image: str = "zonos3-server.exe") -> list[tuple[int, int]]:
+    """``[(pid, parent_pid)]`` for every running process matching *image*.
 
-    Used to test whether an owner *record* is telling the truth. The engine can
-    outlive its spawner, and a peer that merely adopted it can rewrite the record
-    without holding the child handle -- so a live `owner_pid` alone is not proof.
-    The OS parent is measured, not remembered.
+    Native, for the same reason ``_pid_running`` is: the alternatives are
+    subprocesses. Measured on this host, ``tasklist /FI IMAGENAME`` takes ~370 ms
+    and a PowerShell/CIM query ~900 ms, while ``CreateToolhelp32Snapshot`` reads
+    the whole process table in ~20 ms with no process spawn. Two of these call
+    sites are on user-visible paths (the chip's status route and the 1s
+    heartbeat), where a quarter-second stall per poll is the whole cost.
 
-    Native only, for the same reason ``_pid_running`` is: this sits on the
-    heartbeat path. A PowerShell/CIM query takes ~900 ms per call, which is a
-    visible stall in a 1-second loop. ``CreateToolhelp32Snapshot`` answers in
-    microseconds.
+    POSIX falls back to ``pgrep`` (no toolhelp equivalent in stdlib).
     """
+    target = (image or "").lower()
     try:
         if os.name == "nt":
             import ctypes
@@ -731,27 +731,36 @@ def _engine_parent_pid() -> Optional[int]:
             k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
             snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
             if not snap or snap == INVALID_HANDLE_VALUE:
-                return None
+                return []
+            found: list[tuple[int, int]] = []
             try:
                 entry = PROCESSENTRY32W()
                 entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
                 ok = k32.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(entry))
-                target = "zonos3-server.exe"
                 while ok:
                     if (entry.szExeFile or "").lower() == target:
-                        return int(entry.th32ParentProcessID)
+                        found.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
                     ok = k32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(entry))
             finally:
                 k32.CloseHandle(ctypes.c_void_p(snap))
-            return None
-        out = subprocess.run(["pgrep", "-f", "zonos3-server"],
+            return found
+        out = subprocess.run(["pgrep", "-f", Path(target).stem],
                              capture_output=True, text=True, timeout=10).stdout or ""
-        for tok in out.split():
-            if tok.strip().isdigit():
-                return int(tok.strip())
-    except Exception:  # noqa: BLE001 - an unanswerable probe must not block
-        pass
-    return None
+        return [(int(t), 0) for t in out.split() if t.strip().isdigit()]
+    except Exception:  # noqa: BLE001 - a failed probe reports "none running"
+        return []
+
+
+def _engine_parent_pid(image: str = "zonos3-server.exe") -> Optional[int]:
+    """Pid of the process that actually parented the engine, or None.
+
+    Used to test whether an owner *record* is telling the truth. The engine can
+    outlive its spawner, and a peer that merely adopted it can rewrite the record
+    without holding the child handle -- so a live `owner_pid` alone is not proof.
+    The OS parent is measured, not remembered.
+    """
+    found = _engine_processes(image)
+    return found[0][1] if found else None
 
 
 def _pid_running(pid: int) -> bool:
@@ -1483,19 +1492,8 @@ class EngineSupervisor:
         stopped = False
         try:
             if os.name == "nt":
-                out = subprocess.run(
-                    ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
-                    capture_output=True, text=True, timeout=30,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    stdin=subprocess.DEVNULL).stdout or ""
-                pids = []
-                for line in out.splitlines():
-                    parts = [p.strip('"') for p in line.split('","')]
-                    if len(parts) >= 2 and parts[0].lower() == name.lower():
-                        try:
-                            pids.append(int(parts[1]))
-                        except ValueError:
-                            pass
+                # Native process table (~20 ms) instead of `tasklist` (~370 ms).
+                pids = [pid for pid, _parent in _engine_processes(name)]
                 for pid in pids:
                     if pid == os.getpid():
                         continue
@@ -2871,8 +2869,31 @@ class _StatePublisher:
                 os.replace(legacy_tmp, legacy)
             except Exception:  # noqa: BLE001 - the per-pid file is authoritative
                 pass
+            # Prune publishers whose process is gone. Nothing ever removed these,
+            # so the directory reached 57 files on this host — and the reader has
+            # to parse every one of them on each status poll. Cheap: one liveness
+            # check per file, and only for files this process did not just write.
+            self._prune_dead_state_files(out_dir)
         except Exception as exc:  # noqa: BLE001 - telemetry only
             logger.debug("zonos3-tts: could not publish state: %s", exc)
+
+    @staticmethod
+    def _prune_dead_state_files(out_dir: Path) -> None:
+        """Delete ``_engine_state.<pid>.json`` files whose process has exited."""
+        try:
+            for path in out_dir.glob("_engine_state.*.json"):
+                parts = path.name.split(".")
+                if len(parts) < 3 or not parts[1].isdigit():
+                    continue
+                pid = int(parts[1])
+                if pid == os.getpid() or _pid_running(pid):
+                    continue
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        except Exception:  # noqa: BLE001 - housekeeping must never break publish
+            pass
 
 
 def _register_emotion_tools(ctx, pipeline: "EmotionPipeline") -> None:  # noqa: ANN001

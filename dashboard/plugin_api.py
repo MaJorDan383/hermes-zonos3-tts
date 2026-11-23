@@ -69,6 +69,10 @@ def _read_state() -> Dict[str, Any]:
     folder = _state_path().parent
     best: Dict[str, Any] = {}
     best_key = (-1.0, -1.0)
+    # Resolve the running engine ONCE, not per file. `_is_engine_process` used to
+    # rebuild the whole process table per entry, so a directory with a dozen
+    # publisher files cost a dozen snapshots per status poll.
+    live_engine_pids = _query_engine_pids()
     for path in sorted(folder.glob("_engine_state*.json")):
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
@@ -103,11 +107,11 @@ def _read_state() -> Dict[str, Any]:
         # Crucial: the pid must be the SERVER's. A writer that published its own
         # pid in that field (the pre-v1.16.1 bug) would look like live evidence
         # forever, which is what let an unloaded engine keep reading as loaded.
-        # `_is_engine_process` checks the image name, so a host's own pid can
-        # never masquerade as a resident engine.
-        if engine_pid > 0 and _is_engine_process(engine_pid):
+        # Membership in `live_engine_pids` checks the image name, so a host's own
+        # pid can never masquerade as a resident engine.
+        if engine_pid > 0 and engine_pid in live_engine_pids:
             evidence = 2.0
-        elif state.get("tts") == "warm" and _engine_running():
+        elif state.get("tts") == "warm" and live_engine_pids:
             evidence = 1.0
         else:
             evidence = 0.0
@@ -123,25 +127,63 @@ def _engine_image() -> str:
 
 
 def _query_engine_pids() -> set[int]:
-    """Pids whose image is the TTS server, or an empty set when the query fails."""
+    """Pids whose image is the TTS server, or an empty set when the query fails.
+
+    Native ``CreateToolhelp32Snapshot`` rather than ``tasklist``. Measured on this
+    host: ``tasklist /FI IMAGENAME`` costs ~370 ms and this route is polled for
+    the status chip every couple of seconds, so a subprocess per poll was pure
+    latency. The snapshot reads the process table in ~20 ms and spawns nothing.
+
+    Deliberately duplicated from the plugin's ``_engine_processes``: the dashboard
+    module is loaded standalone by the plugin host (and by the regression suite),
+    so importing the plugin package here would couple the two lifetimes for one
+    helper.
+    """
+    target = _engine_image().lower()
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {_engine_image()}",
-             "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=20,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            stdin=subprocess.DEVNULL).stdout or ""
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            TH32CS_SNAPPROCESS = 0x00000002
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260),
+                ]
+
+            k32 = ctypes.windll.kernel32
+            k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+            snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if not snap or snap == INVALID_HANDLE_VALUE:
+                return set()
+            pids: set[int] = set()
+            try:
+                entry = PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                ok = k32.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(entry))
+                while ok:
+                    if (entry.szExeFile or "").lower() == target:
+                        pids.add(int(entry.th32ProcessID))
+                    ok = k32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(entry))
+            finally:
+                k32.CloseHandle(ctypes.c_void_p(snap))
+            return pids
+        out = subprocess.run(["pgrep", "-f", Path(_engine_image()).stem],
+                             capture_output=True, text=True, timeout=10).stdout or ""
+        return {int(t) for t in out.split() if t.strip().isdigit()}
     except Exception:  # noqa: BLE001 - a failed probe reports "not running"
         return set()
-    pids: set[int] = set()
-    for line in out.splitlines():
-        parts = [p.strip('"') for p in line.split('","')]
-        if len(parts) >= 2 and parts[0].lower() == _engine_image():
-            try:
-                pids.add(int(parts[1]))
-            except ValueError:
-                pass
-    return pids
 
 
 def _engine_running() -> bool:
