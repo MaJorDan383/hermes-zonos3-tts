@@ -90,6 +90,11 @@ _DEFAULT_START_TIMEOUT = 120.0
 _DEFAULT_REQUEST_TIMEOUT = 300.0
 _DEFAULT_RETRY_ATTEMPTS = 3
 
+# How long a "may I collect this adopted engine?" verdict is trusted. It runs on
+# the 1s heartbeat and asks the OS for the engine's parent, so it is cached; the
+# window is short enough that a peer dying or starting up is still noticed.
+_COLLECTOR_CACHE_SECONDS = 5.0
+
 # -- prosody defaults -------------------------------------------------------
 # The docs' own advice (guide.md, "Expressiveness in hidden space"):
 #
@@ -694,19 +699,53 @@ def _engine_parent_pid() -> Optional[int]:
     outlive its spawner, and a peer that merely adopted it can rewrite the record
     without holding the child handle -- so a live `owner_pid` alone is not proof.
     The OS parent is measured, not remembered.
+
+    Native only, for the same reason ``_pid_running`` is: this sits on the
+    heartbeat path. A PowerShell/CIM query takes ~900 ms per call, which is a
+    visible stall in a 1-second loop. ``CreateToolhelp32Snapshot`` answers in
+    microseconds.
     """
     try:
         if os.name == "nt":
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance Win32_Process -Filter \"Name='zonos3-server.exe'\" "
-                 "| Select-Object -First 1 -ExpandProperty ParentProcessId"],
-                capture_output=True, text=True, timeout=20,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                stdin=subprocess.DEVNULL).stdout or ""
-        else:
-            out = subprocess.run(["pgrep", "-P", "1", "-f", "zonos3-server"],
-                                 capture_output=True, text=True, timeout=20).stdout or ""
+            import ctypes
+            from ctypes import wintypes
+
+            TH32CS_SNAPPROCESS = 0x00000002
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260),
+                ]
+
+            k32 = ctypes.windll.kernel32
+            k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+            snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if not snap or snap == INVALID_HANDLE_VALUE:
+                return None
+            try:
+                entry = PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                ok = k32.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(entry))
+                target = "zonos3-server.exe"
+                while ok:
+                    if (entry.szExeFile or "").lower() == target:
+                        return int(entry.th32ParentProcessID)
+                    ok = k32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(entry))
+            finally:
+                k32.CloseHandle(ctypes.c_void_p(snap))
+            return None
+        out = subprocess.run(["pgrep", "-f", "zonos3-server"],
+                             capture_output=True, text=True, timeout=10).stdout or ""
         for tok in out.split():
             if tok.strip().isdigit():
                 return int(tok.strip())
@@ -802,6 +841,8 @@ class EngineSupervisor:
         # Unix time before which a failed catalogue probe is not retried, so a
         # repainting picker cannot pay the 2 s connect timeout per call.
         self._down_until = 0.0
+        # (checked_at, may_collect) for can_collect_orphan's TTL
+        self._collector_cache: Optional[tuple[float, bool]] = None
         # speaker id -> controls the server reports as inert for it
         self._disabled_cache: dict[str, frozenset[str]] = {}
 
@@ -1334,11 +1375,22 @@ class EngineSupervisor:
         not have its engine yanked. Whoever notices first becomes the collector
         by rewriting the owner record, so two peers cannot both arm a stop for
         the same engine.
+
+        Cached for a few seconds: this runs on the heartbeat, and the parent
+        query walks the process table. The cache is dropped the moment the
+        outcome flips, so a real change is never masked for longer than the TTL.
         """
         if not self._engine_adopted():
+            self._collector_cache = None
             return False
+        now = time.time()
+        cached = self._collector_cache
+        if cached is not None and now - cached[0] < _COLLECTOR_CACHE_SECONDS:
+            return cached[1]
         owner = self._engine_owner_pid()
-        return owner is None or owner == os.getpid()
+        verdict = owner is None or owner == os.getpid()
+        self._collector_cache = (now, verdict)
+        return verdict
 
     def _claim_ownership(self) -> None:
         """Take over collection of an adopted engine this process can stop."""
