@@ -977,7 +977,13 @@ class EngineSupervisor:
         while time.time() < deadline:
             if self.is_up():
                 return True
-            if self._proc is not None and self._proc.poll() is not None:
+            # Snapshot the handle before calling into it. `stop_process` clears
+            # self._proc, and now that ensure_up runs unlocked a concurrent stop
+            # can null it between the None check and the .poll() -- an
+            # AttributeError on None that would mask the real reason the server
+            # never came up.
+            proc = self._proc
+            if proc is not None and proc.poll() is not None:
                 raise RuntimeError(
                     f"zonos3-server exited during startup: {self._log_tail()}")
             time.sleep(0.2)
