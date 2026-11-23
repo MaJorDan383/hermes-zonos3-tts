@@ -624,20 +624,61 @@ independently:
 | Chip action | *Unload STT (free RAM)* | *Unload model now* |
 
 `stt_preload: true` (default) builds the recogniser once at registration, off the
-request path. `stt_unload_after_seconds` (default `600`) decides what happens when
-the last recording surface releases its lease:
+request path. `stt_unload_after_seconds` decides what happens when the last
+recording surface releases its lease:
 
-- **600** — stay resident for ten minutes, then free the RAM. The default, because
-  323 MB is cheap next to a 1.5 s pause on your next sentence.
+- **-1 — always loaded.** `release()` drops the lease and does nothing else; the
+  recogniser stays resident until the chip unloads it. This is the setting for
+  "always loaded, with a manual unload" — the chip becomes the *only* unload
+  trigger. Note desktop dictation acquires on mic-open and releases on mic-close,
+  so any positive window arms a timer after **every** utterance; `-1` is what
+  stops that entirely.
+- **600** — stay resident for ten minutes, then free the RAM. Cheap in RAM
+  (323 MB) next to a rebuild, but the timer re-arms on every mic close.
 - **0** — unload the instant the mic closes. Correct only if RAM is the binding
   constraint and you accept the rebuild.
 - a timer armed by `release()` is **cancelled by the next `warm()`**. Without that
   a lease taken inside the idle window would be torn down mid-recording.
 
-The chip's *Unload STT* button frees it immediately regardless of the window, and
-is refused while a recording surface holds the recogniser (dropping it then would
-force a 1.5 s rebuild inside the user's next utterance). It never touches the voice
+The chip's *Unload STT* button frees it immediately in every mode, including `-1`,
+and is refused while a recording surface holds the recogniser (dropping it then
+would force a rebuild inside the user's next utterance). It never touches the voice
 engine, and the voice-engine unload never touches the recogniser.
+
+### Adopted engines must be collectable
+
+The engine deliberately outlives the process that spawned it, so after a gateway or
+relay restart the running engine has **no owner**. That used to mean no surface
+would ever collect it: `arm_if_orphaned()` only armed for a state of
+`warm`/`starting`, and an adopted engine has no child handle, so its state could
+read `idle` while it held 3.3 GB of VRAM. Measured live: engine up for 30+ minutes
+with no lease, no timer, and four live processes each deciding it had nothing to
+stop.
+
+Fixed by making adoption a first-class case:
+
+- `_engine_adopted()` — a live engine this object did not spawn (no socket probe, so
+  it is safe under the supervisor lock).
+- `can_collect_orphan()` — arming is allowed only when the recorded owner is **dead**.
+  A live foreign owner keeps its engine; that is the shared-engine race guard.
+- `_claim_ownership()` — whoever arms first rewrites the owner record, so exactly one
+  process is responsible for a given engine.
+
+`_engine_owner_pid()` also stopped calling `is_up()` (a blocking socket probe between
+reading record and returning it), which had made it unusable from the heartbeat
+path that holds `lock`.
+
+Verified end-to-end: spawn the engine from a throwaway child, kill that child, and
+the orphan is adopted, armed, and stopped inside the idle window — VRAM returned.
+
+### Stale state files outranked fresh ones
+
+`_read_state()` filtered writers whose process had died, but a **still-running**
+writer that had not republished in hours kept a frozen `tts: warm` + dead engine pid
+in its file — which won the evidence tier and made the chip report a phantom
+resident engine. It now also ignores entries older than `_STATE_MAX_AGE_SECONDS`
+(90 s), the same window `_staleness` applies to the winner. The directory also
+accumulates one file per process that ever loaded the plugin; prune exited ones.
 
 **Not a quality knob:** raising the sample rate is not offered, because the engine's
 decoder emits 44.1 kHz and only 44.1 kHz (`/v2/generate` has no rate field; every

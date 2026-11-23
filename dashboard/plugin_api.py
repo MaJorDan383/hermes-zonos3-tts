@@ -81,6 +81,16 @@ def _read_state() -> Dict[str, Any]:
         owner = state.get("agent_pid")
         if owner is not None and not _pid_alive(owner):
             continue  # a fossil from a process that exited
+        # A writer can be alive and still be a fossil: a process that has not
+        # republished in hours (paused, wedged, or a build that published before
+        # the heartbeat changed) keeps an old `warm`/pid frozen in its file. That
+        # file must not outrank a fresh one — measured live: a 4-hour-old
+        # `tts: warm, pid: <long-dead engine>` from a still-running host won the
+        # evidence tier and made the chip report a phantom resident engine.
+        # `_staleness` applies the same window to the winner; filtering here
+        # stops a stale entry from being chosen in the first place.
+        if (time.time() - at) > _STATE_MAX_AGE_SECONDS:
+            continue
         try:
             engine_pid = int(state.get("pid") or 0)
         except (TypeError, ValueError):

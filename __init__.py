@@ -861,9 +861,14 @@ class EngineSupervisor:
         gguf = self.model_dir
         return (gguf / "zac-encoder.gguf").is_file() and (gguf / "ssl-teacher.gguf").is_file()
 
-    def _spawn_locked(self) -> None:
-        if self.is_up() or self._starting:
-            return
+    def _spawn(self) -> None:
+        """Start the server process. Slow and lock-free; caller owns ``_starting``.
+
+        Split out of the old ``_spawn_locked``: process creation is the slow half
+        of a cold start, and holding the supervisor lock across it blocked every
+        reader (``snapshot()``, ``is_ready()``, lease acquires). The caller sets
+        ``_starting`` under the lock first, so two threads cannot both get here.
+        """
         if not self.exe.is_file():
             raise RuntimeError(
                 f"zonos3-tts: server binary missing at {self.exe}. Build it from "
@@ -877,18 +882,13 @@ class EngineSupervisor:
         logger.info("zonos3-tts: spawning engine; requested by:\n%s",
                     _trim_stack(caller))
         args = self._argv()
-        self._starting = True
-        self.state = "starting"
-        try:
-            self._log_path.parent.mkdir(parents=True, exist_ok=True)
-            log = open(self._log_path, "ab")
-            self._proc = subprocess.Popen(
-                args, cwd=str(self.runtime_dir), stdout=log,
-                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                if os.name == "nt" else 0)
-        finally:
-            self._starting = False
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = open(self._log_path, "ab")
+        self._proc = subprocess.Popen(
+            args, cwd=str(self.runtime_dir), stdout=log,
+            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if os.name == "nt" else 0)
         logger.info("zonos3-tts: server started pid=%s port=%s",
                     getattr(self._proc, "pid", "?"), self.port)
         # Claim it: this process spawned the engine, so it — and only it — may
@@ -906,6 +906,22 @@ class EngineSupervisor:
         return False
 
     def ensure_up(self) -> None:
+        """Bring the engine up, holding the lock only for the decisions.
+
+        The spawn and the health poll are slow (a cold start measures ~14 s, and
+        ``_wait_up`` may block for ``start_timeout`` = 120 s). Doing them under
+        ``self._lock`` — which this used to — made every other thread that needs
+        that lock wait behind the whole load: ``snapshot()`` (the state
+        publisher's heartbeat), ``is_ready()``, a lease acquire. Measured:
+        ``snapshot()`` blocked 5.9 s behind a 6.1 s ``ensure_up()``.
+
+        So the lock now covers only the decision — is it up, is a stop in flight,
+        is someone already starting it — and the slow work happens outside it.
+        Concurrent callers serialise on ``_starting``: the first becomes the
+        starter, and a second waits for it instead of spawning a second server
+        that would race for the port and orphan one of them.
+        """
+        should_start = False
         with self._lock:
             if self.is_up():
                 # Already serving — an adopted engine or a peer's. Record it so
@@ -926,20 +942,48 @@ class EngineSupervisor:
                     self._lock.acquire()
             if self.is_up():
                 return
-            self._spawn_locked()
+            if self._starting:
+                # Another thread is loading the engine. Do not spawn a second
+                # one; fall through to wait for it below.
+                waiter = True
+            else:
+                waiter = False
+                self._starting = True
+                self.state = "starting"
+                should_start = True
+
+        if waiter:
+            # Somebody else owns the load: wait for their engine instead of
+            # duplicating it. Bounded by the same start timeout.
             if not self._wait_up(time.time() + self.start_timeout):
                 raise RuntimeError(
                     f"zonos3-tts: server not healthy on port {self.port}: {self._log_tail()}")
-            # Listening and healthy means the backbone is resident, so record it.
-            # Leaving the state at "idle" here was a real defect: every later check
-            # that asks "is something running?" believed nothing was, so an engine
-            # brought up by a synthesis restart reported idle while holding 3.3 GB
-            # of VRAM — and the idle-timer guards (which look for warm/starting)
-            # skipped it, leaving it resident forever.
             with self._lock:
                 if self.state in ("starting", "idle", "unloaded", "error"):
                     self.state = "warm"
                     self.loaded_at = time.time()
+            return
+
+        assert should_start
+        try:
+            self._spawn()          # slow: process create + log; no lock held
+            if not self._wait_up(time.time() + self.start_timeout):
+                raise RuntimeError(
+                    f"zonos3-tts: server not healthy on port {self.port}: {self._log_tail()}")
+        finally:
+            with self._lock:
+                self._starting = False
+
+        # Listening and healthy means the backbone is resident, so record it.
+        # Leaving the state at "idle" here was a real defect: every later check
+        # that asks "is something running?" believed nothing was, so an engine
+        # brought up by a synthesis restart reported idle while holding 3.3 GB
+        # of VRAM — and the idle-timer guards (which look for warm/starting)
+        # skipped it, leaving it resident forever.
+        with self._lock:
+            if self.state in ("starting", "idle", "unloaded", "error"):
+                self.state = "warm"
+                self.loaded_at = time.time()
 
     # -- leases -----------------------------------------------------------
     def warm(self) -> None:
@@ -1029,17 +1073,33 @@ class EngineSupervisor:
         with self._lock:
             if self._held or self._idle_timer is not None:
                 return False
-            if self.state not in ("warm", "starting"):
+            # An adopted engine is resident without a ``_proc``, so its state
+            # string may still read "idle"/"unloaded" even though it is holding
+            # VRAM. Treat "an engine is running" as the trigger, not the label.
+            adopted = self._engine_adopted()
+            if self.state not in ("warm", "starting") and not adopted:
+                return False
+            if adopted and not self.can_collect_orphan():
+                # A live peer owns it: it will collect its own engine.
                 return False
             window = self._live("unload_after_seconds", self.unload_after)
             if window <= 0:
                 window = 0.001
             logger.info("zonos3-tts: engine is resident with no lease and no timer; "
-                        "arming the idle stop (%ss)", round(window, 1))
+                        "arming the idle stop (%ss)%s", round(window, 1),
+                        " [adopted engine]" if adopted else "")
             t = threading.Timer(window, self._stop_after_idle)
             t.daemon = True
             self._idle_timer = t
-            t.start()
+            if adopted:
+                self.state = "warm"
+                self.loaded_at = self.loaded_at or time.time()
+        if adopted:
+            # Claim AFTER releasing the lock: this writes the owner file that a
+            # peer's ``can_collect_orphan`` reads, so exactly one process wins
+            # and arms a stop for a given engine.
+            self._claim_ownership()
+        t.start()
         self._notify()
         return True
 
@@ -1047,6 +1107,11 @@ class EngineSupervisor:
         with self._lock:
             if self._held:
                 return
+        # A lease taken since the timer was armed must cancel the stop, and the
+        # timer object is the only record that it already fired: clear it here so
+        # ``arm_if_orphaned`` can arm again after this stop completes.
+        with self._lock:
+            self._idle_timer = None
         self.stop_process()
 
     # -- evidence ---------------------------------------------------------
@@ -1192,12 +1257,69 @@ class EngineSupervisor:
         pid = data.get("owner_pid")
         if not isinstance(pid, int) or pid <= 0:
             return None
-        if not self.is_up():
-            return None  # the recorded owner's engine is gone; the record is stale
+        # Liveness alone decides this. It used to call ``is_up()`` (a blocking
+        # socket probe) in between, which made it unusable from paths that hold
+        # the supervisor lock — ``arm_if_orphaned`` in particular — and it was
+        # redundant: a record whose engine is gone already fails the
+        # ``_pid_running`` check below and returns None anyway.
         if pid != os.getpid() and not _pid_running(pid):
             logger.debug("zonos3-tts: owner pid %d is gone; engine is adoptable", pid)
             return None
         return pid
+
+    def _engine_adopted(self) -> bool:
+        """True when a live engine is running that this object did not spawn.
+
+        A supervisor adopts a server it finds already listening: one left behind
+        by an exited host (the engine deliberately outlives its spawner), or one
+        started by hand. Adoption sets no ``_proc``, which is what makes it
+        invisible to the usual "is a child running?" checks — and that
+        invisibility was a real VRAM leak: the engine stayed resident with no
+        lease and no idle timer because every surface that looked at it decided
+        it had nothing to stop.
+
+        Read-only and never blocking: no socket probe, so it is safe under the
+        supervisor lock.
+        """
+        own = getattr(self._proc, "pid", 0) or 0
+        if own and _pid_running(own):
+            return False  # we have the child handle; not adopted
+        return self._engine_pid() > 0
+
+    def can_collect_orphan(self) -> bool:
+        """True when this process may arm an idle stop for an adopted engine.
+
+        The rule that keeps this safe against the shared-engine race: the owner
+        is dead, so nobody would ever collect it. While the recorded owner is
+        *alive and foreign*, this stays False — a peer that is mid-sentence must
+        not have its engine yanked. Whoever notices first becomes the collector
+        by rewriting the owner record, so two peers cannot both arm a stop for
+        the same engine.
+        """
+        if not self._engine_adopted():
+            return False
+        owner = self._engine_owner_pid()
+        return owner is None or owner == os.getpid()
+
+    def _claim_ownership(self) -> None:
+        """Take over collection of an adopted engine this process can stop."""
+        try:
+            data = json.loads(self._owner_file().read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - a missing record is fine
+            data = {}
+        data.update(
+            owner_pid=os.getpid(),
+            engine_pid=self._engine_pid(),
+            port=self.port,
+            at=time.time(),
+        )
+        tmp = self._owner_file().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, self._owner_file())
+        logger.info(
+            "zonos3-tts: adopted the running engine (pid %s); this process now "
+            "owns its idle stop", data.get("engine_pid"),
+        )
 
     def _record_owner(self) -> None:
         """Claim the running engine for this process, and record which process it IS.
@@ -1316,15 +1438,28 @@ class EngineSupervisor:
             logger.warning("zonos3-tts: orphan engine stop failed: %s", exc)
         return stopped
 
-    def stop_process(self) -> bool:
+    def stop_process(self, *, honour_lease: bool = True) -> bool:
         """Stop the server, returning every byte of VRAM it held.
 
         The server has no route to release its backbone (only the reference
         encoder has an idle reaper), so the process is the unit of unload.
         Stopping it reclaims the weights *and* the KV cache, decoder and CUDA
         context — strictly more than a model-only unload would.
+
+        ``honour_lease`` refuses while a surface holds the engine. The decision
+        is made HERE, under the lock, rather than left to callers: the idle timer
+        checks ``_held`` and then calls this, and a lease taken in the gap between
+        those two steps would previously have been destroyed mid-utterance. The
+        caller-side check is an optimisation; this is the invariant. Pass
+        ``honour_lease=False`` only for a deliberate override (plugin unload).
         """
         with self._lock:
+            if honour_lease and self._held:
+                logger.info(
+                    "zonos3-tts: refusing to stop the engine; a lease is held "
+                    "(would kill speech mid-utterance)")
+                self._cancel_timer_locked()
+                return False
             proc, self._proc = self._proc, None
             self._cancel_timer_locked()
             # Mark the transition explicitly. Terminating, waiting on the child
@@ -2515,7 +2650,10 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
                 ducker.stop()
         except Exception:  # noqa: BLE001
             pass
-        sup.stop_process()
+        # Plugin unload is an explicit teardown, not an idle policy: free the
+        # engine even if a lease is somehow still recorded, or the hook returns
+        # leaving 3.3 GB of VRAM behind with no owner left to stop it.
+        sup.stop_process(honour_lease=False)
 
     try:
         ctx.on_unload(_shutdown)

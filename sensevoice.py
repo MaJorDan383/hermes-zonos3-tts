@@ -927,13 +927,25 @@ def make_stt_provider(detector: SenseVoiceEmotion, *, on_result=None,
             self._det.preload()
 
         def release(self) -> None:
-            """Last STT lease dropped — schedule the idle unload of the backend.
+            """Last STT lease dropped — arm the idle unload, unless pinned resident.
 
             Independent of TTS: the recogniser is CPU/RAM, the voice engine is
             GPU/VRAM, and a user may well want one resident without the other.
-            ``stt_unload_after_seconds`` = 0 unloads immediately (see
-            :meth:`_stt_window`); a positive value arms a one-shot timer that the
-            next ``warm()`` cancels.
+
+            ``stt_unload_after_seconds`` semantics:
+
+            * ``< 0`` — **always loaded**. ``release()`` drops the lease and does
+              nothing else: the recogniser stays resident until the user unloads
+              it from the chip (``unload_now()``). This is the setting for "I
+              want it always loaded with a manual unload", and it is what makes
+              that request mean exactly one thing instead of "600 s after the
+              last thing that borrowed it".
+            * ``0`` — unload immediately on the last release.
+            * ``> 0`` — arm a one-shot timer that the next ``warm()`` cancels.
+
+            Note desktop dictation acquires on mic-open and releases on
+            mic-close, so a positive window arms a timer after **every**
+            utterance; ``< 0`` is what stops that.
             """
             self._lease_held.clear()
             window = self._stt_window()
@@ -941,7 +953,10 @@ def make_stt_provider(detector: SenseVoiceEmotion, *, on_result=None,
             if cancel is not None:
                 cancel.cancel()
                 self._stt_timer = None
-            if window <= 0:
+            if window < 0:
+                # Pinned: never schedule anything. The chip is the only unload.
+                return
+            if window == 0:
                 self._det.unload()
                 return
             timer = threading.Timer(window, self._det.unload)
