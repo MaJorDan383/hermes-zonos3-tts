@@ -687,6 +687,34 @@ def _trim_stack(text: str) -> str:
     return "\n".join(interesting[-8:] or lines[-6:])
 
 
+def _engine_parent_pid() -> Optional[int]:
+    """Pid of the process that actually parented the running engine, or None.
+
+    Used to test whether an owner *record* is telling the truth. The engine can
+    outlive its spawner, and a peer that merely adopted it can rewrite the record
+    without holding the child handle -- so a live `owner_pid` alone is not proof.
+    The OS parent is measured, not remembered.
+    """
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name='zonos3-server.exe'\" "
+                 "| Select-Object -First 1 -ExpandProperty ParentProcessId"],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                stdin=subprocess.DEVNULL).stdout or ""
+        else:
+            out = subprocess.run(["pgrep", "-P", "1", "-f", "zonos3-server"],
+                                 capture_output=True, text=True, timeout=20).stdout or ""
+        for tok in out.split():
+            if tok.strip().isdigit():
+                return int(tok.strip())
+    except Exception:  # noqa: BLE001 - an unanswerable probe must not block
+        pass
+    return None
+
+
 def _pid_running(pid: int) -> bool:
     """True when *pid* names a live process.
 
@@ -1257,14 +1285,25 @@ class EngineSupervisor:
         pid = data.get("owner_pid")
         if not isinstance(pid, int) or pid <= 0:
             return None
-        # Liveness alone decides this. It used to call ``is_up()`` (a blocking
-        # socket probe) in between, which made it unusable from paths that hold
-        # the supervisor lock — ``arm_if_orphaned`` in particular — and it was
-        # redundant: a record whose engine is gone already fails the
-        # ``_pid_running`` check below and returns None anyway.
-        if pid != os.getpid() and not _pid_running(pid):
-            logger.debug("zonos3-tts: owner pid %d is gone; engine is adoptable", pid)
-            return None
+        # A live pid is not proof of ownership: the engine can outlive the process
+        # that spawned it, and a peer that merely ADOPTED the engine rewrites this
+        # record without ever acquiring the child handle. Observed live: the record
+        # named the dashboard (alive) while the engine's real parent was a dead
+        # relay (119248), so every surface believed a live peer owned it and
+        # nothing ever collected it -- the "unload does nothing" symptom.
+        #
+        # Ask the OS who actually parented the engine. If the recorded owner is not
+        # that parent, the record is a false claim and the engine is adoptable.
+        if pid != os.getpid():
+            if not _pid_running(pid):
+                logger.debug("zonos3-tts: owner pid %d is gone; engine is adoptable", pid)
+                return None
+            parent = _engine_parent_pid()
+            if parent is not None and parent != pid:
+                logger.debug(
+                    "zonos3-tts: owner record claims %d but the engine's parent is %d; "
+                    "record is a false claim, engine is adoptable", pid, parent)
+                return None
         return pid
 
     def _engine_adopted(self) -> bool:
