@@ -1207,6 +1207,29 @@ class EngineSupervisor:
             self._idle_timer = None
         self.stop_process()
 
+    def mark_error(self, message: str) -> None:
+        """Record a synthesis failure as the engine's state. Never raises.
+
+        The provider used to reach into ``self._sup._lock`` to set ``state`` and
+        ``last_error`` directly. That works, but it makes the supervisor's
+        locking discipline a contract the provider has to know about — and it
+        already has a public ``mark_warm`` for the success path. Same idea, so
+        the error path gets the same seam.
+        """
+        with self._lock:
+            self.state = "error"
+            self.last_error = str(message or "")
+        self._notify()
+
+    def mark_error_quiet(self, message: str) -> None:
+        """Record ``last_error`` without forcing the state to ``error``.
+
+        For "the engine is fine, this take was bad" (silent audio retries) — the
+        residency state must not flip away from ``warm`` because one take failed.
+        """
+        with self._lock:
+            self.last_error = str(message or "")
+
     # -- evidence ---------------------------------------------------------
     def mark_warm(self) -> None:
         with self._lock:
@@ -2447,9 +2470,7 @@ class Zonos3TTS(TTSProvider):
             except Exception as exc:  # noqa: BLE001 - dispatcher builds the envelope
                 last_error = str(exc)
                 if attempt + 1 >= attempts:
-                    with self._sup._lock:
-                        self._sup.state = "error"
-                        self._sup.last_error = last_error
+                    self._sup.mark_error(last_error)
                     raise RuntimeError(
                         f"ZONOS3-Mini synthesis failed: {last_error}") from exc
                 time.sleep(0.15 * (attempt + 1))
@@ -2460,8 +2481,7 @@ class Zonos3TTS(TTSProvider):
             logger.warning("zonos3-tts: silent audio on attempt %d/%d; retrying",
                            attempt + 1, attempts)
         else:
-            with self._sup._lock:
-                self._sup.last_error = last_error
+            self._sup.mark_error_quiet(last_error)
             raise RuntimeError(
                 f"ZONOS3-Mini returned silent audio after {attempts} attempts")
 
@@ -3096,12 +3116,25 @@ class EmotionPipeline:
         # Arm the reply voice now, so the synthesis that follows this turn
         # already sounds right.
         if self.prosody:
-            self._apply_reply_voice()
+
+            self._apply_reply_voice(emotion, intensity)
         return {"ok": True, "emotion": emotion, "intensity": intensity or None,
                 "events": events, "text": result.text, "affect_source": why}
 
-    def _apply_reply_voice(self) -> None:
-        controls = emotion_mod.reply_prosody(self._emotion, self._intensity,
+    def _apply_reply_voice(self, emotion: Optional[str] = None,
+                           intensity: Optional[float] = None) -> None:
+        """Steer the reply voice to the given affect (default: current state).
+
+        Called from observe_result *outside* the lock that just set _emotion, so
+        reading the fields here was an unsynchronised read of state another
+        thread (a second utterance) could be replacing. Passing the values the
+        caller already holds makes that explicit and removes the race.
+        """
+        if emotion is None:
+            emotion = self._emotion
+        if intensity is None:
+            intensity = self._intensity
+        controls = emotion_mod.reply_prosody(emotion, intensity,
                                             enabled=self.prosody)
         if controls:
             self.provider.set_emotion_controls(controls)
