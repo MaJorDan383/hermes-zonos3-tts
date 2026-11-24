@@ -1188,13 +1188,22 @@ class EngineSupervisor:
         return True
 
     def _stop_after_idle(self) -> None:
+        """Idle timer fired: stop the engine, unless a lease protects it.
+
+        One lock acquisition for the whole decision. Clearing ``_idle_timer`` in a
+        separate critical section left a window where the timer was unset but the
+        stop had not begun, so ``arm_if_orphaned`` (on its own 1s thread) could
+        arm a *second* timer for an engine that was already stopping — two
+        pending stops for one engine.
+
+        ``stop_process`` re-checks ``_held`` under the same lock, so a lease taken
+        after this point is still honoured; the check here is only to avoid
+        starting a teardown we already know is unwanted.
+        """
         with self._lock:
             if self._held:
+                self._idle_timer = None
                 return
-        # A lease taken since the timer was armed must cancel the stop, and the
-        # timer object is the only record that it already fired: clear it here so
-        # ``arm_if_orphaned`` can arm again after this stop completes.
-        with self._lock:
             self._idle_timer = None
         self.stop_process()
 
