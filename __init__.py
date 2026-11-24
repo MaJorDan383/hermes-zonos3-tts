@@ -795,6 +795,26 @@ def _engine_parent_pid(image: str = "zonos3-server.exe") -> Optional[int]:
     return found[0][1] if found else None
 
 
+def _pcm_has_audio(pcm: bytes, floor: int = _PAD_FLOOR) -> bool:
+    """True when *pcm* contains at least one sample above the silence floor.
+
+    Used to tell a real take from an all-zero one before handing anything to the
+    speaker. Cheap: a max over the buffer, and it stops at the first loud sample
+    in the common case because callers pass the growing prefix.
+    """
+    if not pcm:
+        return False
+    try:
+        import numpy as np
+
+        samples = np.frombuffer(pcm[: len(pcm) - (len(pcm) % 2)], dtype="<i2")
+        if samples.size == 0:
+            return False
+        return bool(np.abs(samples.astype(np.int32)).max() > floor)
+    except Exception:  # noqa: BLE001 - a failed probe must not drop audio
+        return True
+
+
 def _pid_running(pid: int) -> bool:
     """True when *pid* names a live process.
 
@@ -2289,72 +2309,107 @@ class Zonos3TTS(TTSProvider):
         if not text or not text.strip():
             return
         payload = self._payload(text, voice, speed, extra)
+
+        # The engine renders silence for some seeds. Measured on this host: 8 of
+        # 14 unseeded takes were all-zero PCM, and a fixed seed is deterministic
+        # (seed=999 silent every time, seed=12345 clean every time). synthesize()
+        # already retries with a NEW seed; stream() did not, so a silent take
+        # reached the speaker as nothing at all -- the reply simply did not speak.
+        #
+        # The take is buffered until it proves non-silent, so a retry happens
+        # before any audio has been handed to the host.
+        attempts = max(1, int(self._sup.retry_attempts))
         chunks = None
+        rate = 0
         buffered = b""
-        started = False          # incremental trim: have we passed the front pad?
+        last_error = ""
+        found_audio = False
         try:
-            try:
-                rate, _channels, chunks = self._sup.client.generate_pcm(
-                    payload, timeout=self._sup.request_timeout)
-            except (urllib.error.URLError, ConnectionError, OSError) as exc:
-                # A stopped engine must not look like a broken stream: restart and
-                # retry once, mirroring synthesize().
-                logger.info("zonos3-tts: streaming engine was down (%s); restarting", exc)
-                self._sup.ensure_up()
-                rate, _channels, chunks = self._sup.client.generate_pcm(
-                    payload, timeout=self._sup.request_timeout)
+            for attempt in range(attempts):
+                if attempt:
+                    payload = {**payload,
+                               "seed": (int(time.time() * 1000) + attempt * 7919) % 2147483647}
+                    logger.warning(
+                        "zonos3-tts: silent streamed take (%s); retrying (%d/%d)",
+                        last_error or "empty", attempt + 1, attempts)
+                try:
+                    rate, _channels, chunks = self._sup.client.generate_pcm(
+                        payload, timeout=self._sup.request_timeout)
+                except (urllib.error.URLError, ConnectionError, OSError) as exc:
+                    # A stopped engine must not look like a broken stream: restart
+                    # and retry once, mirroring synthesize(). This also covers the
+                    # socket reset a previous attempt's close can leave behind.
+                    logger.info("zonos3-tts: streaming engine was down (%s); restarting", exc)
+                    time.sleep(0.1)
+                    self._sup.ensure_up()
+                    rate, _channels, chunks = self._sup.client.generate_pcm(
+                        payload, timeout=self._sup.request_timeout)
+
+                # Pull only enough to know whether this take is worth speaking. The
+                # front trim needs a prefix anyway, so this is the same prefix,
+                # examined before we commit to the attempt.
+                buffered = b""
+                found_audio = False
+                while True:
+                    try:
+                        buffered += next(chunks)
+                    except StopIteration:
+                        break
+                    if _pcm_has_audio(buffered):
+                        found_audio = True
+                        break
+                if found_audio:
+                    break
+                last_error = "all-zero PCM"
+                try:
+                    chunks.close()          # cancels the rest of this take
+                except Exception:  # noqa: BLE001 - teardown must not raise
+                    pass
+                chunks = None
+                # Closing a streamed response mid-take makes the engine reset that
+                # socket; a fresh request issued immediately after occasionally
+                # inherits the reset (ConnectionResetError: 10054). A short settle
+                # lets the engine finish tearing the take down.
+                time.sleep(0.1)
+
+            if not found_audio:
+                self._sup.mark_error_quiet(last_error)
+                raise RuntimeError(
+                    f"ZONOS3-Mini returned silent audio after {attempts} attempts")
+
             # Record the engine's own rate before yielding, so the host opens the
             # device at 44100 rather than its 24000 default.
             self.stream_sample_rate = int(rate)
+
             # Iterate explicitly rather than `yield from`: the host barges in by
             # breaking out of its loop, which never calls close() on us. An
             # explicit loop means that break propagates as GeneratorExit HERE, so
-            # the `finally` below closes the HTTP response — and a closed response
-            # is what makes the engine stop decoding. `yield from` would hand the
-            # abandonment to the inner generator without this frame ever learning
-            # about it.
+            # the `finally` below closes the HTTP response -- and a closed response
+            # is what makes the engine stop decoding.
+            started = False
             for chunk in chunks:
                 if not self._stream_trim and not self._level_match:
                     yield chunk
                     continue
-                # The host cuts the reply into sentences and calls us once per
-                # sentence, so the seams a reader hears are between STREAM calls,
-                # not inside one. Each call therefore pads the front the way a
-                # standalone utterance does, and streaming it verbatim puts
-                # ~240 ms of dead air before every sentence.
-                #
-                # Trimming that pad needs only a PREFIX — the first non-silent
-                # sample — so it runs incrementally below and audio starts as soon
-                # as the pad is behind us. Level matching needs the whole sentence
-                # (it is a single gain over every sample), so only that case still
-                # waits for the buffer.
                 buffered += chunk
                 if self._level_match:
-                    # Level matching needs the whole sentence: one gain applied to
-                    # every sample. Only this mode buffers to the end.
                     continue
                 if not started:
-                    # Front trim needs only a PREFIX. Emit as soon as the first
-                    # non-silent sample is buffered, then stop scanning.
                     emitted = self._emit_trimmed_from(buffered, int(rate), started)
                     if emitted:
                         started = True
                         buffered = b""
                         yield emitted
                 elif len(buffered) > self._tail_hold_bytes(int(rate)):
-                    # Past the pad, so everything here is audio. Stream it through,
-                    # holding back a margin that may be the trailing silence.
                     keep = self._tail_hold_bytes(int(rate))
                     yield buffered[:-keep]
                     buffered = buffered[-keep:]
+
             if self._level_match:
-                # Whole-sentence path: trim edges, then one gain for the sentence.
                 final = self._stream_ready(buffered, int(rate))
             elif started:
-                # Incremental path: only the held-back tail remains; trim its end.
                 final = self._stream_tail(buffered, int(rate)) if buffered else b""
             else:
-                # Never found a non-silent sample: the whole take was pad.
                 final = b""
             for offset in range(0, len(final), self._stream_out_size):
                 yield final[offset:offset + self._stream_out_size]
