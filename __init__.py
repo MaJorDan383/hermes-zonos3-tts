@@ -1795,8 +1795,16 @@ class Zonos3TTS(TTSProvider):
         self._fade_out_ms = None if fade_out_ms is None else max(0, int(fade_out_ms))
         # Reference level for streamed sentences: the first one seeds it, then a
         # running median over the reply's sentences takes over.
+        #
+        # Guarded by `_stream_lock`: the host's TTSProvider contract says
+        # ``stream()`` "may run concurrently for consecutive sentences of one
+        # reply (the speaker prefetches up to 3), so it must be thread-safe".
+        # Without the lock, two prefetched sentences could both read None as the
+        # reference and both write, so the running median is computed from a
+        # torn list — and `del self._stream_levels[0]` could race an append.
         self._stream_ref_db: Optional[float] = None
         self._stream_levels: list[float] = []
+        self._stream_lock = threading.Lock()
         # Hermes only takes the raw-PCM path when this is true AND
         # stream_sample_rate is valid; the rate is read from the engine's own
         # X-Audio-Sample-Rate header at stream time, so this is just the opt-in.
@@ -1866,9 +1874,12 @@ class Zonos3TTS(TTSProvider):
     def release(self) -> None:
         self._sup.release()
         # A new reply starts a new level reference; carrying the old one across
-        # turns would match this reply to a louder/quieter previous one.
-        self._stream_ref_db = None
-        self._stream_levels = []
+        # turns would match this reply to a louder/quieter previous one. Done
+        # under the lock so a stream still draining the previous reply cannot
+        # write into the fresh window.
+        with self._stream_lock:
+            self._stream_ref_db = None
+            self._stream_levels = []
 
     def is_ready(self) -> bool:
         return self._sup.is_ready()
@@ -2362,16 +2373,21 @@ class Zonos3TTS(TTSProvider):
             return pcm
         import numpy as np
 
+        # Read the reference under the lock so a concurrent prefetched sentence
+        # cannot hand us a half-updated anchor.
+        with self._stream_lock:
+            ref_db = self._stream_ref_db
         out, level = _trim_raw_pcm(
             pcm, rate, lead_ms=self._seam_lead_ms, tail_ms=self._seam_tail_ms,
-            ref_db=self._stream_ref_db, level_match=self._level_match)
+            ref_db=ref_db, level_match=self._level_match)
         if level is not None:
-            self._stream_levels.append(level)
-            # Keep the window bounded: a long reply should not let its first
-            # sentences weigh as much as its last.
-            if len(self._stream_levels) > 9:
-                del self._stream_levels[0]
-            self._stream_ref_db = float(np.median(self._stream_levels))
+            with self._stream_lock:
+                self._stream_levels.append(level)
+                # Keep the window bounded: a long reply should not let its first
+                # sentences weigh as much as its last.
+                if len(self._stream_levels) > 9:
+                    del self._stream_levels[0]
+                self._stream_ref_db = float(np.median(self._stream_levels))
         return out
 
     def _char_budget(self) -> int:
