@@ -101,6 +101,16 @@ _COLLECTOR_CACHE_SECONDS = 5.0
 _FIRST_READ_BYTES = 4096
 _READ_BYTES = 65536
 
+# Amplitude (int16) below which a sample counts as silence when trimming the
+# engine's edge padding. ~-60 dBFS. Named rather than a bare 32 so the two trim
+# paths (_trim_edges and the incremental stream trim) cannot drift apart.
+_PAD_FLOOR = 32
+
+# How much audio to hold back from a streamed sentence's tail so it can still be
+# trimmed. The engine pads ~240 ms at the end of a take; this must exceed that or
+# the trailing silence is emitted before the trim ever sees it.
+_TAIL_HOLD_MS = 400
+
 # -- prosody defaults -------------------------------------------------------
 # The docs' own advice (guide.md, "Expressiveness in hidden space"):
 #
@@ -1808,7 +1818,8 @@ class Zonos3TTS(TTSProvider):
                  steer_onset: Optional[float] = None,
                  steer_ramp: Optional[float] = None,
                  headroom_db: Optional[float] = None,
-                 seam_smoothing: bool = True,
+                 seam_smoothing: Optional[bool] = None,
+                 stream_trim: bool = True,
                  level_match: bool = True,
                  seam_lead_ms: int = 40,
                  seam_tail_ms: int = 20,
@@ -1840,7 +1851,27 @@ class Zonos3TTS(TTSProvider):
         self._headroom_db = None if headroom_db is None else max(0.0, float(headroom_db))
         # Seam smoothing: trim the per-request edge padding and match chunk levels
         # before splicing. Off disables both, restoring the raw concatenation.
-        self._seam_smoothing = bool(seam_smoothing)
+        # Streaming pipeline, three separable behaviours (v1.17.2).
+        #
+        # They used to be one `seam_smoothing` switch, which forced all-or-nothing:
+        # trimming the engine's ~240 ms front pad and matching levels across a
+        # reply BOTH required buffering the whole sentence, so turning smoothing
+        # off to get low latency also reintroduced the dead air it existed to
+        # remove. They are not the same cost:
+        #
+        #   stream_trim  removes the front/back pad       -> needs only a PREFIX
+        #   level_match  evens volume across the reply    -> needs the whole buffer
+        #
+        # So trimming now runs incrementally (audio starts as soon as the first
+        # non-silent sample is seen, ~70 ms) and level matching stays opt-in.
+        #
+        # `seam_smoothing` is retained as a deprecated alias: True maps to both
+        # behaviours on (the old default), False to both off, so an existing
+        # config keeps meaning what it meant.
+        if seam_smoothing is False:
+            stream_trim = False
+            level_match = False
+        self._stream_trim = bool(stream_trim)
         self._level_match = bool(level_match)
         self._seam_lead_ms = max(0, int(seam_lead_ms))
         self._seam_tail_ms = max(0, int(seam_tail_ms))
@@ -2260,6 +2291,7 @@ class Zonos3TTS(TTSProvider):
         payload = self._payload(text, voice, speed, extra)
         chunks = None
         buffered = b""
+        started = False          # incremental trim: have we passed the front pad?
         try:
             try:
                 rate, _channels, chunks = self._sup.client.generate_pcm(
@@ -2282,21 +2314,48 @@ class Zonos3TTS(TTSProvider):
             # abandonment to the inner generator without this frame ever learning
             # about it.
             for chunk in chunks:
-                if not self._seam_smoothing:
+                if not self._stream_trim and not self._level_match:
                     yield chunk
                     continue
                 # The host cuts the reply into sentences and calls us once per
                 # sentence, so the seams a reader hears are between STREAM calls,
                 # not inside one. Each call therefore pads the front the way a
                 # standalone utterance does, and streaming it verbatim puts
-                # ~230 ms of dead air before every sentence. Buffer this
-                # sentence, trim its edges, match it to the level of the reply so
-                # far, then stream the result — the trim costs one sentence of
-                # latency, which the sentence chunker already imposes.
+                # ~240 ms of dead air before every sentence.
+                #
+                # Trimming that pad needs only a PREFIX — the first non-silent
+                # sample — so it runs incrementally below and audio starts as soon
+                # as the pad is behind us. Level matching needs the whole sentence
+                # (it is a single gain over every sample), so only that case still
+                # waits for the buffer.
                 buffered += chunk
-            if not self._seam_smoothing:
-                return
-            final = self._stream_ready(buffered, int(rate))
+                if self._level_match:
+                    # Level matching needs the whole sentence: one gain applied to
+                    # every sample. Only this mode buffers to the end.
+                    continue
+                if not started:
+                    # Front trim needs only a PREFIX. Emit as soon as the first
+                    # non-silent sample is buffered, then stop scanning.
+                    emitted = self._emit_trimmed_from(buffered, int(rate), started)
+                    if emitted:
+                        started = True
+                        buffered = b""
+                        yield emitted
+                elif len(buffered) > self._tail_hold_bytes(int(rate)):
+                    # Past the pad, so everything here is audio. Stream it through,
+                    # holding back a margin that may be the trailing silence.
+                    keep = self._tail_hold_bytes(int(rate))
+                    yield buffered[:-keep]
+                    buffered = buffered[-keep:]
+            if self._level_match:
+                # Whole-sentence path: trim edges, then one gain for the sentence.
+                final = self._stream_ready(buffered, int(rate))
+            elif started:
+                # Incremental path: only the held-back tail remains; trim its end.
+                final = self._stream_tail(buffered, int(rate)) if buffered else b""
+            else:
+                # Never found a non-silent sample: the whole take was pad.
+                final = b""
             for offset in range(0, len(final), self._stream_out_size):
                 yield final[offset:offset + self._stream_out_size]
         finally:
@@ -2371,7 +2430,7 @@ class Zonos3TTS(TTSProvider):
         """
         if not parts:
             return b""
-        if not self._seam_smoothing:
+        if not self._stream_trim and not self._level_match:
             return _merge_wav(parts)
 
         decoded = [_wav_pcm(part) for part in parts]
@@ -2408,6 +2467,60 @@ class Zonos3TTS(TTSProvider):
         return _parts_to_wav(matched, channels, rate)
 
     _stream_out_size = 32 * 1024  # one PortAudio-friendly write (int16 bytes)
+
+    def _tail_hold_bytes(self, rate: int) -> int:
+        """Bytes to hold back from the stream tail so it can still be trimmed.
+
+        Must cover the engine's actual trailing pad, not just the trim margin. The
+        pad measures ~240 ms at the end of a take (the mirror of the front pad),
+        so holding only ``seam_tail_ms + 40`` left ~400 ms of silence in the
+        streamed output — measured: the incremental path ran 404 ms longer than
+        the whole-sentence path on the same sentence.
+        """
+        ms = int(self._seam_tail_ms) + _TAIL_HOLD_MS
+        return max(2, int(rate * ms / 1000) * 2)
+
+    def _emit_trimmed_from(self, pcm: bytes, rate: int, started: bool) -> bytes:
+        """Return the part of *pcm* past the engine's front pad, or b"".
+
+        Incremental form of the lead trim in :func:`_trim_edges`. It needs only a
+        PREFIX: once a non-silent sample appears, everything from
+        ``first_voiced - lead`` onward is real audio and can go out immediately.
+        Returns ``b""`` while the whole buffer is still pad, so the caller keeps
+        accumulating.
+
+        Keeping `lead_ms` of margin means the attack transient is not clipped --
+        the same margin :func:`_trim_edges` keeps -- so the incremental and
+        whole-sentence paths sound identical.
+        """
+        import numpy as np
+
+        if started:
+            return pcm
+        samples = np.frombuffer(pcm, dtype="<i2")
+        if samples.size == 0:
+            return b""
+        loud = np.nonzero(np.abs(samples.astype(np.int32)) > _PAD_FLOOR)[0]
+        if loud.size == 0:
+            return b""                      # still pad; keep buffering
+        lead = int(rate * self._seam_lead_ms / 1000)
+        begin = max(0, int(loud[0]) - lead)
+        return samples[begin:].tobytes()
+
+    def _stream_tail(self, pcm: bytes, rate: int) -> bytes:
+        """Trim tail silence from the remainder of an incrementally-trimmed
+        sentence. The front was already emitted, so only the end is trimmed."""
+        import numpy as np
+
+        samples = np.frombuffer(pcm, dtype="<i2")
+        if samples.size == 0:
+            return b""
+        loud = np.nonzero(np.abs(samples.astype(np.int32)) > _PAD_FLOOR)[0]
+        if loud.size == 0:
+            return b""                      # trailing pad only; drop it
+        tail = int(rate * self._seam_tail_ms / 1000)
+        end = min(samples.size, int(loud[-1]) + 1 + tail)
+        return samples[:end].tobytes()
 
     def _stream_ready(self, pcm: bytes, rate: int) -> bytes:
         """Trim and level-match one streamed sentence for playback.
@@ -2536,6 +2649,21 @@ def _bool_setting(ctx, key: str, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _optional_bool_setting(ctx, key: str) -> Optional[bool]:
+    """Bool setting that distinguishes "absent" (None) from an explicit value.
+
+    Used for deprecated aliases: when the key is not set the caller must fall back
+    to its new defaults, not to ``False``. A plain ``_bool_setting`` with a default
+    would make an unset alias silently mean "off".
+    """
+    raw = _setting(ctx, key, None)
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _live_setting_fn(ctx):
     """Re-read settings with a short cache.
 
@@ -2644,7 +2772,10 @@ def register(ctx) -> None:  # noqa: ANN001 - host-provided plugin context
         steer_ramp=_float_setting(ctx, "steer_ramp_seconds", _DEFAULT_STEER_RAMP),
         headroom_db=(_float_setting(ctx, "headroom_db", -1.0)
                      if _setting(ctx, "headroom_db", None) is not None else None),
-        seam_smoothing=_bool_setting(ctx, "seam_smoothing", True),
+        # `seam_smoothing` is a deprecated alias handled inside the provider; the
+        # two behaviours it used to bundle are now independent settings.
+        seam_smoothing=_optional_bool_setting(ctx, "seam_smoothing"),
+        stream_trim=_bool_setting(ctx, "stream_trim", True),
         level_match=_bool_setting(ctx, "level_match", True),
         seam_lead_ms=int(_setting(ctx, "seam_lead_ms", 40) or 0),
         seam_tail_ms=int(_setting(ctx, "seam_tail_ms", 20) or 0),
