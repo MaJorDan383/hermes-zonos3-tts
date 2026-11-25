@@ -236,7 +236,9 @@ _REPLY_DIRECTIONS = {
 
 
 def reply_prosody(emotion: Optional[str], intensity: float = 0.0,
-                  *, enabled: bool = True, allow_raw: bool = False) -> dict[str, float]:
+                  *, enabled: bool = True, allow_raw: bool = False,
+                  previous: Optional[str] = None, turn: int = 0,
+                  seed: Optional[int] = None) -> dict[str, float]:
     """ZONOS3 `controls` for the spoken reply.
 
     Returns ``{}`` for neutral (or when disabled) so the engine uses its own
@@ -249,12 +251,19 @@ def reply_prosody(emotion: Optional[str], intensity: float = 0.0,
     spec = REPLY_PROSODY.get(key) or {}
     if not spec:
         return {}
-    direction = _REPLY_DIRECTIONS.get(spec["emotion"])
+    # Which ENGINE direction to use is now chosen from the affect's pool rather
+    # than fixed by the table, so repeated affects vary and the 14 directions the
+    # old mapping ignored become reachable. turn=0 (the default) keeps the
+    # reasoned table entry, so callers that pass no history are unchanged.
+    chosen, variant_scale, _why = choose_direction(
+        key, previous=previous, turn=turn, intensity=intensity, seed=seed)
+    primary = chosen or spec["emotion"]
+    direction = _REPLY_DIRECTIONS.get(primary)
     if not direction:
         return {}
     # Blend the user's intensity into the dose: a mild user gets a light touch,
     # a strong one gets the full (already-modest) dose.
-    scale = 0.4 + 0.6 * _as_intensity(intensity)
+    scale = (0.4 + 0.6 * _as_intensity(intensity)) * variant_scale
     controls = {direction: round(spec["dose"] * scale, 2)}
 
     # A second, weaker direction where one could not distinguish two affects
@@ -438,6 +447,149 @@ def coverage_gaps(emotions) -> dict[str, list[str]]:
         if len(names) > 1:
             gaps["collapsed"].append(f"{key[0]}: {'/'.join(names)}")
     return gaps
+
+
+# --------------------------------------------------------------- emotion pools
+#
+# SenseVoice emits 7 labels; the engine accepts 23 emotion directions. The old
+# table threw that away by mapping each label to ONE fixed direction, so a
+# recurring affect always sounded identical and 14 usable directions sat unused.
+#
+# Each pool is now a set of plausible replies for the same detected affect. The
+# first entry is the default (the reasoned "meet, flip valence" stance); the rest
+# are alternatives chosen when history makes them a better fit.
+#
+# `avoid` is an explicit anti-pattern, not just documentation: some directions
+# agree with the user's affect and make things worse, so they must never be
+# reached by rotation no matter how many turns pass.
+_POOLS: dict[str, dict] = {
+    "angry": {
+        "directions": ["serene", "proud", "content", "interested"],
+        "avoid": ["angry", "distressed", "pained"],
+        "reason": "steady, never matching the heat",
+    },
+    "frustrated": {
+        "directions": ["serene", "proud", "realizing", "interested"],
+        "avoid": ["disappointed", "angry", "sad"],
+        "reason": "resolve and forward motion, never regret",
+    },
+    "sad": {
+        "directions": ["content", "relieved", "serene", "interested"],
+        "avoid": ["happy", "ecstatic", "adoring"],
+        "reason": "warm company, never bright-siding",
+    },
+    "fearful": {
+        "directions": ["serene", "relieved", "content", "proud"],
+        "avoid": ["scared", "distressed", "fearful"],
+        "reason": "reassurance, never amplifying the threat",
+    },
+    "happy": {
+        "directions": ["happy", "content", "adoring", "interested"],
+        "avoid": ["ecstatic", "desirous"],
+        "reason": "share it lightly, never gush",
+    },
+    "excited": {
+        "directions": ["happy", "ecstatic", "interested", "proud"],
+        "avoid": ["adoring"],
+        "reason": "match momentum",
+    },
+    "surprised": {
+        "directions": ["realizing", "interested", "confused", "content"],
+        "avoid": ["surprised", "embarrassed"],
+        "reason": "arrive at understanding rather than mirror the shock",
+    },
+    "disgusted": {
+        "directions": ["disgusted", "content", "interested", "serene"],
+        "avoid": ["pained", "distressed"],
+        "reason": "acknowledge the distaste, stay civil",
+    },
+    "frustrated_after_anger": {
+        "directions": ["proud", "serene", "realizing", "content"],
+        "avoid": ["disappointed", "angry"],
+        "reason": "anger that has cooled needs resolve, not more empathy",
+    },
+    "sad_after_fear": {
+        "directions": ["relieved", "serene", "content", "proud"],
+        "avoid": ["sad", "distressed"],
+        "reason": "fear that has resolved should sound like relief",
+    },
+}
+
+# How far the chosen direction may sit from its pool's default before rotation
+# is allowed to pick it. Higher = more variance between turns.
+POOL_TEMPERATURE = 0.55
+
+
+def _pool_for(emotion: str, previous: Optional[str]) -> dict:
+    """Pick the pool for an affect, refined by what was heard last turn.
+
+    History matters because two different sequences can share a label: a user who
+    was ANGRY and is now FRUSTRATED is cooling down, while one who was SAD and is
+    now FRUSTRATED is heating up. Those want different replies from the same
+    detected word.
+    """
+    key = normalise(emotion)
+    prev = normalise(previous) if previous else None
+    special = f"{key}_after_{prev}" if prev else None
+    if special and special in _POOLS:
+        return _POOLS[special] | {"id": special}
+    return (_POOLS.get(key) or {}) | {"id": key}
+
+
+def choose_direction(emotion: Optional[str], *, previous: Optional[str] = None,
+                     turn: int = 0, intensity: float = 0.0,
+                     seed: Optional[int] = None) -> tuple[str, float, str]:
+    """Choose which engine emotion direction this reply should use.
+
+    Returns ``(direction, dose_scale, why)``.
+
+    Deterministic on ``(emotion, previous, turn, intensity)`` so a given
+    conversation replays identically -- an emotion that changes on every request
+    would make the voice feel unstable rather than alive. History does the
+    varying: consecutive turns with the same affect walk through the pool, so
+    three frustrated turns sound like three related but distinct replies.
+
+    The first turn of any affect always uses the pool default, which is the stance
+    the tables were reasoned out for. Rotation only advertises alternatives.
+    """
+    key = normalise(emotion)
+    pool = _pool_for(key, previous)
+    options = [d for d in pool.get("directions", []) if d not in (pool.get("avoid") or [])]
+    if not options:
+        return "", 1.0, "no pool"
+
+    # Turn 0 keeps the reasoned default: the first impression should be the
+    # intended one, not a random variant.
+    if turn <= 0:
+        return options[0], 1.0, pool.get("reason", "")
+
+    # WALK the pool by turn index, offset by history. Hashing turn into the index
+    # was wrong: hash() clustered onto two values for adjacent turn numbers and
+    # the rotation stuck on one alternative instead of cycling.
+    #
+    # History shifts the phase, so the same affect reached from a different
+    # previous affect starts at a different point in the pool -- that is the whole
+    # point of passing `previous`, and without the offset it had no effect at all.
+    phase = 0
+    prev = normalise(previous) if previous else ""
+    if prev and prev != key:
+        phase = 1 + (abs(hash(prev)) % max(1, len(options) - 1))
+    base = (turn - 1) + phase
+    if seed is not None:
+        base += abs(hash(seed)) % max(1, len(options))
+
+    # Deeper intensity narrows toward the default; mild intensity wanders more,
+    # because a barely-audible affect does not justify a strong stance change.
+    #
+    # The floor is 2, not 1: at high intensity the previous formula rounded to a
+    # spread of one, which silently disabled rotation entirely -- every turn
+    # returned options[0] and the pools looked broken. Emphasis and variety are
+    # different knobs and intensity should not switch variety off.
+    level = _as_intensity(intensity)
+    span = 1 + int(round(len(options) * (1.0 - level)))
+    spread = max(2, min(span, len(options))) if len(options) > 1 else 1
+    idx = base % spread
+    return options[idx], 0.85, pool.get("reason", "")
 
 
 def infer_affect(emotion: Optional[str], events: Optional[list[str]] = None,

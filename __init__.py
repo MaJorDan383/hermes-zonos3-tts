@@ -160,7 +160,18 @@ _DEFAULT_VOLUME_BOOST = 2.0      # delivery.loud, safe band 0-4; the engine's on
 # safety rail, not a taste setting: at 1.0 a happy turn peaked at -0.5 dBFS (the
 # limiter); at 0.7 it centres near -2.2 dBFS and stays a colouring rather than a
 # shout. See emotion_controls().
-_EMOTION_MAX_DOSE = 0.7
+# Raised from 0.7 after measuring the actual limiter headroom rather than
+# trusting the old comment. The 0.7 ceiling was set when a happy turn peaked at
+# -0.5 dBFS -- but that measurement predates the always-on prosody stack, and the
+# cause was the STACK, not the dose: with volume_boost 2.0 the UNSTEERED baseline
+# already peaks at 0.00 dBFS, so no dose value can add emphasis because there is
+# no headroom left to express it. That is why emotion needed "more emphasis" and
+# raising the cap would not have delivered it.
+#
+# 0.9 keeps a little protection for mis-detections (SenseVoice calls plenty of
+# ordinary speech "happy") without clamping the directions that need to read
+# clearly.
+_EMOTION_MAX_DOSE = 0.9
 
 # Steer-then-hold. A constant hidden-space push integrates over a long line: the
 # model copies the style of speech it has already produced, so stacked liveliness
@@ -267,9 +278,14 @@ def emotion_controls(emotion: Optional[str], intensity: float = 1.0) -> dict[str
     return ``{}`` — an unrecognised emotion must never break speech, and neutral
     sends no controls at all so the engine uses its own defaults.
 
-    The result is capped at ``_EMOTION_MAX_DOSE``. Full dose on top of the always-on
-    prosody stack drove the peak to -0.5 dBFS on a happy turn against -1.5 for
-    neutral — i.e. into the engine's limiter, which is heard as a shout. At 0.7 the
+    The result is capped at ``_EMOTION_MAX_DOSE``. Note the cap is NOT the lever
+    for "more emphasis": measured with the live stack, the unsteered baseline
+    already sits at the limiter, so a higher dose clamps instead of expressing.
+    Emphasis comes from leaving headroom in the always-on gain (volume_boost),
+    which is why that is the setting to lower if emotion sounds flat. Full dose on
+    top of the always-on prosody stack drove the peak to -0.5 dBFS on a happy turn
+    against -1.5 for neutral — i.e. into the engine's limiter, which is heard as
+    a shout. At 0.7 the
     same turn centres around -2.2 dBFS: still audibly different from neutral, with
     headroom left for the realisation peaks that actually carry emotion. Detection
     also over-fires (SenseVoice calls plenty of ordinary speech "happy"), so a dose
@@ -3359,6 +3375,11 @@ class EmotionPipeline:
         self._events: list[str] = []
         self._at = 0.0
         self._turn_consumed = True   # nothing pending until real speech arrives
+        # History for emotion-pool selection: the affect heard last turn, and how
+        # many turns of the current run. The pool chooser uses both, so a repeated
+        # affect walks through its alternatives instead of repeating itself.
+        self._prev_emotion: Optional[str] = None
+        self._turn_index = 0
         # Remembers a run of the same affect so sustained irritation can escalate
         # to "frustrated" and sustained enthusiasm to "excited" -- distinctions
         # SenseVoice cannot make per-utterance but a conversation can.
@@ -3426,6 +3447,11 @@ class EmotionPipeline:
                 logger.info("zonos3-tts: %s sustained for %d turns -> %s",
                             base, run_length, emotion)
         with self._lock:
+            # Advance history only when the affect actually changes, so a run of
+            # the same emotion counts up (and rotates) while a new affect resets.
+            if emotion != self._emotion or not self._turn_consumed:
+                self._turn_index += 1
+            self._prev_emotion = self._emotion if self._turn_consumed else emotion
             self._emotion = emotion
             self._intensity = intensity
             self._events = events
@@ -3457,8 +3483,13 @@ class EmotionPipeline:
         # control is in play, so mirror that exactly rather than assume.
         allow_raw = bool(self.provider.speaker_embedding_available(
             self.provider._last_voice))
-        controls = emotion_mod.reply_prosody(emotion, intensity,
-                                            enabled=self.prosody, allow_raw=allow_raw)
+        # History drives BOTH which direction is chosen and how far the stance
+        # rotates: the same detected affect on turn 3 should not sound identical
+        # to turn 1, and two different sequences that share a label (angry ->
+        # frustrated vs sad -> frustrated) should not be answered the same way.
+        controls = emotion_mod.reply_prosody(
+            emotion, intensity, enabled=self.prosody, allow_raw=allow_raw,
+            previous=self._prev_emotion, turn=max(0, self._turn_index - 1))
         if controls:
             self.provider.set_emotion_controls(controls)
         else:

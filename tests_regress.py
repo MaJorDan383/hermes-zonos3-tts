@@ -190,6 +190,57 @@ _tempo_emitted = any("delivery.tempo" in _emo.reply_prosody(e, 1.0)
                      for e in _all_emo if _emo.REPLY_PROSODY.get(e, {}).get("tempo", 1.0) != 1.0)
 check("reply tempo is actually emitted", _tempo_emitted)
 
+print("\n== emotion pools: more than one direction per detection ==")
+# SenseVoice emits 7 labels but the engine accepts 23 directions. The pools make
+# the extra ones reachable, so a repeated affect is not one fixed voice.
+_poolless = [e for e in _all_emo
+             if e != "neutral" and not _emo._POOLS.get(e, {}).get("directions")]
+check("every non-neutral emotion has a pool", not _poolless, str(_poolless))
+
+check("turn 0 uses the reasoned default",
+      _emo.choose_direction("frustrated", turn=0, intensity=0.8)[0]
+      == _emo._POOLS["frustrated"]["directions"][0])
+
+_variants = {_emo.choose_direction("frustrated", previous="frustrated",
+                                  turn=t, intensity=0.8)[0] for t in range(1, 9)}
+check("a repeated affect rotates through its pool", len(_variants) >= 2, str(sorted(_variants)))
+
+check("high intensity does NOT switch rotation off",
+      len({_emo.choose_direction("angry", previous="angry", turn=t, intensity=1.0)[0]
+           for t in range(1, 9)}) >= 2)
+
+# Avoid-list is load-bearing: these directions agree with the user's affect and
+# make it worse, so rotation must never reach them.
+_bad = []
+for _e, _p in _emo._POOLS.items():
+    for _t in range(40):
+        for _i in (0.05, 0.5, 0.95):
+            for _pv in (None, "angry", "sad", "frustrated", _e):
+                _d = _emo.choose_direction(_e, previous=_pv, turn=_t, intensity=_i)[0]
+                if _d in (_p.get("avoid") or []):
+                    _bad.append(("AVOID", _e, _d))
+                elif _d and _d not in _p["directions"]:
+                    _bad.append(("OUT", _e, _d))
+check("rotation never picks an avoided direction", not _bad, str(_bad[:4]))
+
+check("history shifts where the rotation starts",
+      [_emo.choose_direction("frustrated", previous=p, turn=t, intensity=0.7)[0]
+       for t in range(1, 4) for p in ("angry",)]
+      != [_emo.choose_direction("frustrated", previous=None, turn=t, intensity=0.7)[0]
+          for t in range(1, 4)])
+
+_seq = [_emo.choose_direction("sad", previous="fearful", turn=t, intensity=0.6)[0]
+        for t in range(6)]
+check("choice is deterministic",
+      _seq == [_emo.choose_direction("sad", previous="fearful", turn=t, intensity=0.6)[0]
+               for t in range(6)])
+
+check("every chosen direction resolves on the engine",
+      all(_emo.choose_direction(e, previous=p, turn=t, intensity=0.5)[0]
+          in _emo._REPLY_DIRECTIONS
+          for e in _all_emo if e != "neutral"
+          for p in (None, "angry") for t in (0, 1, 4)))
+
 print("\n== the reply settles across sentences ==")
 # steer_release is null on this bundle, so "meet then settle" cannot happen inside
 # one utterance -- only across the reply. The opening sentence must carry the full
