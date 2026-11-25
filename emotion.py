@@ -36,9 +36,9 @@ RESPONSE_GUIDANCE: dict[str, dict[str, str]] = {
         "do": "lead with the concrete fix or the one decision that unblocks it",
     },
     "frustrated": {
-        "acknowledge": "recognise that progress is not happening",
-        "avoid": "do not repeat the plan they already rejected",
-        "do": "offer the smallest next step that produces a visible result",
+        "acknowledge": "recognise that this has gone on across several exchanges, not just this one",
+        "avoid": "do not repeat any approach that has already been tried and did not work, and do not ask them to re-explain",
+        "do": "say plainly what you are doing differently now, or admit the current approach is wrong and name the alternative",
     },
     "sad": {
         "acknowledge": "sit with it for one sentence; do not rush to cheer them up",
@@ -56,9 +56,9 @@ RESPONSE_GUIDANCE: dict[str, dict[str, str]] = {
         "do": "keep momentum: answer directly and keep the energy",
     },
     "excited": {
-        "acknowledge": "share the momentum",
-        "avoid": "do not bury the answer under caveats",
-        "do": "answer first, caveats second and short",
+        "acknowledge": "match the momentum — they are already enthusiastic, so do not re-sell it",
+        "avoid": "do not bury the answer under caveats, and do not slow down to reassure them",
+        "do": "answer first and make it actionable now; keep caveats to one clause at the end",
     },
     "surprised": {
         "acknowledge": "confirm what is actually unusual here",
@@ -95,6 +95,26 @@ def normalise(emotion: Optional[str]) -> str:
     return key if key in RESPONSE_GUIDANCE else "neutral"
 
 
+def _as_intensity(intensity: Optional[float]) -> float:
+    """Coerce a missing intensity to 0.0.
+
+    `intensity` is Optional because the backend may not expose CTC posteriors:
+    the sherpa path reports ``intensity=None`` on purpose (see
+    ``sensevoice._SherpaBackend``), and the ONNX path leaves it None whenever the
+    winning token is neutral/unknown. Every consumer below compares it to a
+    threshold, so a bare None was a TypeError waiting for the day the engine
+    setting changed -- not a hypothetical, this install can flip to sherpa with
+    one config line.
+    """
+    if intensity is None:
+        return 0.0
+    try:
+        value = float(intensity)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
 def response_guidance(emotion: Optional[str], intensity: float = 0.0) -> str:
     """One-paragraph instruction telling the model how to answer this affect.
 
@@ -105,8 +125,9 @@ def response_guidance(emotion: Optional[str], intensity: float = 0.0) -> str:
     if key == "neutral":
         return ""
     spec = RESPONSE_GUIDANCE[key]
-    strength = ("strongly" if intensity >= 0.66
-                else "moderately" if intensity >= 0.33 else "mildly")
+    level = _as_intensity(intensity)
+    strength = ("strongly" if level >= 0.66
+                else "moderately" if level >= 0.33 else "mildly")
     return (f"The user's speech sounded {strength} {key}. "
             f"{spec['acknowledge'].capitalize()}; {spec['avoid']}; {spec['do']}. "
             "Respond to what they actually said — the emotion is context, not the subject.")
@@ -153,7 +174,7 @@ def annotate_user_text(text: str, emotion: Optional[str], intensity: float = 0.0
 REPLY_PROSODY: dict[str, dict] = {
     #                 steer the reply toward          tempo  reason (kept short)
     "angry":      {"emotion": "serene",    "dose": 0.7, "tempo": 0.95},   # calm authority
-    "frustrated": {"emotion": "content",   "dose": 0.5, "tempo": 1.00},
+    "frustrated": {"emotion": "serene",    "dose": 0.7, "tempo": 0.98},   # steady, not complacent
     "sad":        {"emotion": "content",   "dose": 0.35, "tempo": 1.00},  # warm, not jubilant
     "fearful":    {"emotion": "serene",    "dose": 0.8, "tempo": 0.95},   # steady reassurance
     "happy":      {"emotion": "happy",     "dose": 0.4, "tempo": 1.05},   # share it lightly
@@ -194,8 +215,8 @@ def reply_prosody(emotion: Optional[str], intensity: float = 0.0,
     if not direction:
         return {}
     # Blend the user's intensity into the dose: a mild user gets a light touch,
-    # a strong one gets the full （already-modest) dose.
-    scale = 0.4 + 0.6 * max(0.0, min(1.0, float(intensity)))
+    # a strong one gets the full (already-modest) dose.
+    scale = 0.4 + 0.6 * _as_intensity(intensity)
     return {direction: round(spec["dose"] * scale, 2)}
 
 
@@ -219,6 +240,87 @@ _EVENT_AFFECT: dict[str, dict] = {
     "cry":       {"emotion": "sad",    "weight": 0.85},
     "laughter":  {"emotion": "happy",  "weight": 0.55},
 }
+
+
+# ------------------------------------------------------------------- escalation
+#
+# SenseVoice emits seven labels; the guidance/prosody tables carry nine. The two
+# extras -- "frustrated" and "excited" -- are distinctions the model cannot make
+# (it folds irritation into ANGRY and enthusiasm into HAPPY) but which the
+# *conversation* can: a user who is angry about something that keeps not working
+# needs a different answer from one who is angry about a single shock, and a
+# user who is excited wants momentum rather than a report.
+#
+# Without this, both rows were unreachable dead code AND, worse, every sustained
+# irritation was answered with the single-incident "lead with the concrete fix"
+# stance -- which is exactly the advice that had already failed them.
+#
+# The signal is temporal: the same affect recurring across consecutive turns.
+# One angry turn is an event; three is a pattern.
+_ESCALATION: dict[str, dict] = {
+    # from      -> to            when this many consecutive turns agree
+    "angry":     {"to": "frustrated", "turns": 2},
+    "happy":     {"to": "excited",    "turns": 2},
+}
+
+# A pattern needs a strong signal, not a shrug: repeated mild readings are noise.
+_ESCALATION_MIN_INTENSITY = 0.33
+
+# How long a run may sit between turns and still count as "the same mood". Beyond
+# this the user has moved on and the run restarts.
+RUN_WINDOW_SECONDS = 180.0
+
+
+class AffectTracker:
+    """Remembers the last few affects so a run of them can escalate.
+
+    Deliberately not part of :mod:`emotion`'s pure functions: this is the only
+    piece with state, and keeping it separate means the tables above stay
+    testable without a clock.
+    """
+
+    def __init__(self, window_seconds: float = RUN_WINDOW_SECONDS) -> None:
+        self._window = float(window_seconds)
+        self._label: Optional[str] = None
+        self._count = 0
+        self._at = 0.0
+
+    def observe(self, emotion: Optional[str], intensity: Optional[float] = None,
+                *, now: Optional[float] = None) -> tuple[str, int]:
+        """Record one turn's affect; return ``(effective_emotion, run_length)``.
+
+        The effective emotion is the base label until a run is long enough to
+        escalate, at which point it becomes the escalated one. Intensity is not
+        altered -- the run says nothing about how loud the last turn was.
+        """
+        import time as _time
+
+        key = normalise(emotion)
+        stamp = _time.time() if now is None else float(now)
+        level = _as_intensity(intensity)
+
+        if key == "neutral":
+            # A flat turn ends any run: silence is not evidence of a pattern.
+            self._label, self._count, self._at = None, 0, stamp
+            return key, 0
+        if (key == self._label and self._count
+                and (stamp - self._at) <= self._window):
+            self._count += 1
+        else:
+            self._count = 1
+        self._label = key
+        self._at = stamp
+
+        spec = _ESCALATION.get(key)
+        if spec and self._count >= spec["turns"] and level >= _ESCALATION_MIN_INTENSITY:
+            return spec["to"], self._count
+        return key, self._count
+
+    def snapshot(self) -> dict:
+        import time as _time
+
+        return {"label": self._label, "count": self._count,
+                "age_seconds": round(_time.time() - self._at, 1) if self._at else None}
 
 
 def infer_affect(emotion: Optional[str], events: Optional[list[str]] = None,

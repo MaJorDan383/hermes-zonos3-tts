@@ -3266,6 +3266,12 @@ class EmotionPipeline:
         self._events: list[str] = []
         self._at = 0.0
         self._turn_consumed = True   # nothing pending until real speech arrives
+        # Remembers a run of the same affect so sustained irritation can escalate
+        # to "frustrated" and sustained enthusiasm to "excited" -- distinctions
+        # SenseVoice cannot make per-utterance but a conversation can.
+        self._affect_run = (emotion_mod.AffectTracker()
+                            if emotion_mod is not None
+                            and hasattr(emotion_mod, "AffectTracker") else None)
 
     # -- STT side ---------------------------------------------------------
     def observe_audio(self, audio_path: str | Path) -> dict:
@@ -3315,6 +3321,17 @@ class EmotionPipeline:
         if why != "emotion only" and why != "no affect detected":
             logger.debug("zonos3-tts: affect %s -> %s (%.2f): %s",
                          result.emotion, emotion, intensity, why)
+        # A single angry turn is an event; a run of them is a pattern, and the
+        # answer that helps differs. Escalation happens here so both the reply
+        # stance and the reply voice see the same value.
+        run_length = 0
+        if self._affect_run is not None:
+            base = emotion
+            emotion, run_length = self._affect_run.observe(emotion, intensity)
+            if emotion != base:
+                why = f"{why}; run of {run_length} -> {emotion}"
+                logger.info("zonos3-tts: %s sustained for %d turns -> %s",
+                            base, run_length, emotion)
         with self._lock:
             self._emotion = emotion
             self._intensity = intensity
@@ -3429,7 +3446,11 @@ class EmotionPipeline:
         guidance = emotion_mod.response_guidance(emotion, intensity)
         if not guidance:
             return None
-        line = f"[heard: {emotion} {intensity:.1f}"
+        # intensity is Optional (a backend without CTC posteriors reports None);
+        # formatting it directly raised TypeError and silently killed the
+        # annotation, so the model never learned how the user sounded.
+        heard_intensity = 0.0 if intensity is None else float(intensity)
+        line = f"[heard: {emotion} {heard_intensity:.1f}"
         if events:
             interesting = [e for e in events
                            if e.lower() not in {"speech", "speech_noise", "event_unk", "bgm"}]
