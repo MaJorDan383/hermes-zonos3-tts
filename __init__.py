@@ -218,10 +218,22 @@ EMOTION_CONTROLS: dict[str, dict[str, float]] = {
     "excited":   {"emotions.happy": 1.2, "emotions.ecstatic": 0.6, "delivery.tempo": 1.0},
     "sad":       {"emotions.sad": 1.2},
     "angry":     {"emotions.angry": 1.2},
+    # Frustration is anger plus duration. It needs its own entry or the label
+    # returned an EMPTY steer and the reply fell back to the engine default --
+    # the one affect that most needs a deliberate voice got no voice at all.
+    # Slightly lower than angry because a frustrated user is worn down rather
+    # than activated, and a hotter read is the last thing they want.
+    "frustrated": {"emotions.angry": 1.0, "emotions.disappointed": 0.5},
     "fearful":   {"emotions.fearful": 1.0},
     "surprised": {"emotions.surprised": 1.0},
     "disgusted": {"emotions.disgusted": 1.0},
 }
+
+# Every label the detector can emit, or that escalation can produce. Both
+# control tables must cover this set: a label with no entry silently falls back
+# to the engine default, which is the failure this constant exists to prevent.
+DETECTABLE_EMOTIONS = ("neutral", "happy", "sad", "angry", "fearful",
+                       "disgusted", "surprised", "frustrated", "excited")
 
 _MOOD_KEYS = frozenset({"mood.valence", "mood.arousal", "mood.dominance",
                         "mood.loudness", "mood.tempo", "mood.clarity",

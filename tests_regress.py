@@ -29,6 +29,11 @@ m = importlib.util.module_from_spec(spec)
 sys.modules["zreg"] = m
 spec.loader.exec_module(m)
 
+_emo_spec = importlib.util.spec_from_file_location("zreg_emotion", PLUGIN / "emotion.py")
+_emo = importlib.util.module_from_spec(_emo_spec)
+sys.modules["zreg_emotion"] = _emo
+_emo_spec.loader.exec_module(_emo)
+
 aspec = importlib.util.spec_from_file_location("zreg_api", PLUGIN / "dashboard" / "plugin_api.py")
 api = importlib.util.module_from_spec(aspec)
 aspec.loader.exec_module(api)
@@ -154,6 +159,36 @@ check("int16-aligned", len(total) > 0 and len(total) % 2 == 0, f"{len(total)} by
 check("rate set to engine's", prov.stream_sample_rate == 44100, str(prov.stream_sample_rate))
 check("audio real", len(total) > 20000, f"{len(total)//2} samples")
 check("empty -> no chunks", list(prov.stream("", voice="Savannah")) == [])
+
+print("\n== every detectable emotion has its equivalent steer ==")
+# The contract: anything the pipeline can PRODUCE (detector labels plus
+# escalation targets) must have a response stance AND a reply steer, every
+# direction named must exist on the engine, and no two emotions may collapse to
+# the same voice -- a table row that silently does nothing is the bug this
+# guards against.
+_all_emo = list(m.DETECTABLE_EMOTIONS)
+_gaps = _emo.coverage_gaps(_all_emo)
+check("guidance covers every emotion", not _gaps["guidance"], str(_gaps["guidance"]))
+check("prosody covers every emotion", not _gaps["prosody"], str(_gaps["prosody"]))
+check("every direction exists in _REPLY_DIRECTIONS", not _gaps["directions"],
+      str(_gaps["directions"]))
+check("no two emotions share one voice", not _gaps["collapsed"],
+      str(_gaps["collapsed"]))
+
+check("frustrated has an input-side steer",
+      bool(m.emotion_controls("frustrated", 1.0)),
+      str(m.emotion_controls("frustrated", 1.0)))
+check("every non-neutral emotion steers the reply voice",
+      all(_emo.reply_prosody(e, 0.8) for e in _all_emo if e != "neutral"),
+      str([e for e in _all_emo if e != "neutral" and not _emo.reply_prosody(e, 0.8)]))
+check("neutral stays unsteered", _emo.reply_prosody("neutral", 0.8) == {})
+
+# Tempo used to sit in the table with no effect at all (reply_tempo had no
+# caller). It is now folded into delivery.tempo, so a non-1.0 tempo must appear
+# in the emitted controls.
+_tempo_emitted = any("delivery.tempo" in _emo.reply_prosody(e, 1.0)
+                     for e in _all_emo if _emo.REPLY_PROSODY.get(e, {}).get("tempo", 1.0) != 1.0)
+check("reply tempo is actually emitted", _tempo_emitted)
 
 print("\n== prosody + emotion are level-safe ==")
 ctrl = m.emotion_controls("happy", 2.0)

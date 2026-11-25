@@ -171,16 +171,24 @@ def annotate_user_text(text: str, emotion: Optional[str], intensity: float = 0.0
 # angry as the user escalates, and matching a sad user's sadness drags the
 # conversation down. Neutral replies stay unsteered so the engine keeps its own
 # natural default.
+# `secondary` is optional: a second direction at a weaker dose, for the cases
+# where one direction cannot distinguish two affects. Only used where a single
+# steer would be an exact duplicate of another emotion's.
 REPLY_PROSODY: dict[str, dict] = {
-    #                 steer the reply toward          tempo  reason (kept short)
-    "angry":      {"emotion": "serene",    "dose": 0.7, "tempo": 0.95},   # calm authority
-    "frustrated": {"emotion": "serene",    "dose": 0.7, "tempo": 0.98},   # steady, not complacent
-    "sad":        {"emotion": "content",   "dose": 0.35, "tempo": 1.00},  # warm, not jubilant
-    "fearful":    {"emotion": "serene",    "dose": 0.8, "tempo": 0.95},   # steady reassurance
-    "happy":      {"emotion": "happy",     "dose": 0.4, "tempo": 1.05},   # share it lightly
-    "excited":    {"emotion": "happy",     "dose": 0.5, "tempo": 1.08},
-    "surprised":  {"emotion": "interested", "dose": 0.4, "tempo": 1.02},
-    "disgusted":  {"emotion": "serene",    "dose": 0.4, "tempo": 1.00},
+    #                 primary steer              dose   tempo   secondary
+    "angry":      {"emotion": "serene",     "dose": 0.70, "tempo": 0.95,
+                   "secondary": {"direction": "proud", "dose": 0.20}},   # calm authority
+    "frustrated": {"emotion": "serene",     "dose": 0.70, "tempo": 0.98,
+                   "secondary": {"direction": "disappointed", "dose": 0.25}},  # steady, unimpressed
+    "sad":        {"emotion": "content",    "dose": 0.35, "tempo": 1.00},  # warm, not jubilant
+    "fearful":    {"emotion": "serene",     "dose": 0.80, "tempo": 0.92,
+                   "secondary": {"direction": "relieved", "dose": 0.20}},  # steady reassurance
+    "happy":      {"emotion": "happy",      "dose": 0.40, "tempo": 1.05},  # share it lightly
+    "excited":    {"emotion": "happy",      "dose": 0.50, "tempo": 1.08,
+                   "secondary": {"direction": "ecstatic", "dose": 0.25}},  # genuine momentum
+    "surprised":  {"emotion": "interested", "dose": 0.40, "tempo": 1.02},
+    "disgusted":  {"emotion": "disgusted",  "dose": 0.35, "tempo": 1.00,
+                   "secondary": {"direction": "content", "dose": 0.20}},  # distaste, staying civil
     "neutral":    {},
 }
 
@@ -189,11 +197,21 @@ REPLY_PROSODY: dict[str, dict] = {
 # delivery/expressive); these are the ones this mapping needs, and `serene` /
 # `content` / `interested` are chosen because they read as composed rather than
 # blank, which is what "sympathetic but steady" sounds like.
+# Every one of these is accepted by the served bundle and measurably changes the
+# audio. The bundle advertises 23 emotion directions; only six are exposed as
+# mood sliders WITH a published measurement, which is not the same as "only six
+# work" -- the rest resolve fine when sent directly. Verified by rendering each
+# at a fixed seed and comparing bytes against an unsteered take.
 _REPLY_DIRECTIONS = {
     "serene": "emotions.serene",
     "content": "emotions.content",
     "interested": "emotions.interested",
     "happy": "emotions.happy",
+    "proud": "emotions.proud",
+    "disappointed": "emotions.disappointed",
+    "relieved": "emotions.relieved",
+    "ecstatic": "emotions.ecstatic",
+    "disgusted": "emotions.disgusted",
 }
 
 
@@ -217,11 +235,32 @@ def reply_prosody(emotion: Optional[str], intensity: float = 0.0,
     # Blend the user's intensity into the dose: a mild user gets a light touch,
     # a strong one gets the full (already-modest) dose.
     scale = 0.4 + 0.6 * _as_intensity(intensity)
-    return {direction: round(spec["dose"] * scale, 2)}
+    controls = {direction: round(spec["dose"] * scale, 2)}
+
+    # A second, weaker direction where one could not distinguish two affects
+    # (see the table). Sent at the same scaled dose so the pair stays in
+    # proportion at every intensity.
+    secondary = spec.get("secondary") or {}
+    second = _REPLY_DIRECTIONS.get(secondary.get("direction", ""))
+    if second:
+        controls[second] = round(secondary.get("dose", 0.0) * scale, 2)
+
+    # Tempo was carried in this table but never emitted -- reply_tempo() existed
+    # and had no caller, so every tempo value here was dead. `delivery.tempo` is
+    # the direction the engine actually honours (the same one `speed` maps onto),
+    # so fold it in rather than leave a column of numbers that does nothing.
+    tempo = spec.get("tempo")
+    if tempo and abs(float(tempo) - 1.0) > 1e-3:
+        controls["delivery.tempo"] = round((float(tempo) - 1.0) * 4.0, 3)
+    return controls
 
 
 def reply_tempo(emotion: Optional[str], *, enabled: bool = True) -> Optional[float]:
-    """Rate multiplier for the reply, or None to leave the engine default."""
+    """Rate multiplier for the reply, or None to leave the engine default.
+
+    Kept for callers that want the number itself; :func:`reply_prosody` already
+    folds it into ``delivery.tempo``, so applying both would double the effect.
+    """
     if not enabled:
         return None
     spec = REPLY_PROSODY.get(normalise(emotion)) or {}
@@ -321,6 +360,49 @@ class AffectTracker:
 
         return {"label": self._label, "count": self._count,
                 "age_seconds": round(_time.time() - self._at, 1) if self._at else None}
+
+
+def coverage_gaps(emotions) -> dict[str, list[str]]:
+    """Report which emotions lack a usable steer in either table.
+
+    The requirement is that every emotion the pipeline can *produce* has an
+    equivalent steer in both directions:
+
+      guidance  what the model should SAY  (RESPONSE_GUIDANCE)
+      prosody   how the reply should SOUND (REPLY_PROSODY)
+      directs   ...and every direction it names must exist on the engine
+
+    This is a function rather than a test so it can also be asserted at import
+    time by the plugin and called from the dashboard, and it returns gaps instead
+    of raising so a partial mapping still speaks.
+    """
+    gaps: dict[str, list[str]] = {"guidance": [], "prosody": [], "directions": [],
+                                  "collapsed": []}
+    seen: dict[tuple, list[str]] = {}
+    for name in emotions:
+        if name not in RESPONSE_GUIDANCE:
+            gaps["guidance"].append(name)
+        spec = REPLY_PROSODY.get(name)
+        if spec is None:
+            gaps["prosody"].append(name)
+            continue
+        if name == "neutral":
+            continue            # neutral deliberately sends no controls
+        primary = spec.get("emotion")
+        if not primary or primary not in _REPLY_DIRECTIONS:
+            gaps["directions"].append(f"{name}:{primary}")
+        secondary = (spec.get("secondary") or {}).get("direction")
+        if secondary and secondary not in _REPLY_DIRECTIONS:
+            gaps["directions"].append(f"{name}:{secondary}")
+        # Two emotions resolving to the SAME directions at the SAME doses are one
+        # voice wearing two labels.
+        key = (primary, round(float(spec.get("dose", 0)), 2),
+               secondary, round(float((spec.get("secondary") or {}).get("dose", 0)), 2))
+        seen.setdefault(key, []).append(name)
+    for key, names in seen.items():
+        if len(names) > 1:
+            gaps["collapsed"].append(f"{key[0]}: {'/'.join(names)}")
+    return gaps
 
 
 def infer_affect(emotion: Optional[str], events: Optional[list[str]] = None,
