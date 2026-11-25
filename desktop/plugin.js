@@ -30,9 +30,11 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  Input,
+  ScrollArea,
   useQuery
 } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { jsx } from 'react/jsx-runtime'
 
 const ID = 'zonos3-tts'
@@ -68,6 +70,304 @@ function windowText(seconds) {
   if (!Number.isFinite(s) || s <= 0) return 'never'
   if (s % 60 === 0) return `${s / 60} min`
   return `${Math.round(s)} s`
+}
+
+/**
+ * Play a base64 WAV returned by the plugin backend.
+ *
+ * The plugin bridge (`ctx.rest`) is JSON-only -- there is no binary response
+ * channel -- so previews arrive as base64 and are handed to an <audio> element
+ * via a blob URL. The URL is revoked on replace so repeated previews do not leak
+ * blob memory for the life of the window.
+ */
+function usePreviewPlayer() {
+  const [playing, setPlaying] = useState("")
+  const [busy, setBusy] = useState("")
+  const [error, setError] = useState("")
+  const audioRef = useRef(null)
+  const urlRef = useRef("")
+
+  useEffect(() => () => {
+    if (urlRef.current) URL.revokeObjectURL(urlRef.current)
+    if (audioRef.current) audioRef.current.pause()
+  }, [])
+
+  const stop = () => {
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current = null
+    }
+    setPlaying("")
+  }
+
+  const play = (name, b64) => {
+    setError("")
+    stop()
+    try {
+      const bin = atob(b64)
+      const bytes = new Uint8Array(bin.length)
+      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i)
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current)
+      const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }))
+      urlRef.current = url
+      const audio = new Audio(url)
+      audio.onended = () => setPlaying("")
+      audio.onerror = () => {
+        setPlaying("")
+        setError("playback failed")
+      }
+      audioRef.current = audio
+      setPlaying(name)
+      audio.play().catch((err) => {
+        setPlaying("")
+        setError(String((err && err.message) || err || "playback blocked"))
+      })
+    } catch (err) {
+      setPlaying("")
+      setError(String((err && err.message) || err || "bad audio"))
+    }
+  }
+
+  return { play, stop, playing, busy, setBusy, error, setError }
+}
+
+/**
+ * One list of voices: engine voices, downloaded clips, and the open catalogue.
+ *
+ * Catalogue rows carry an explicit "Add" button because auditioning and keeping
+ * are different decisions -- previewing should not silently download 150 clips.
+ * A downloaded row switches to a remove control and starts feeding the engine.
+ */
+function VoicePicker({ ctx, status }) {
+  const [filter, setFilter] = useState("")
+  const [showGallery, setShowGallery] = useState(false)
+  const [note, setNote] = useState("")
+  const player = usePreviewPlayer()
+
+  const voices = useQuery({
+    queryKey: [ID, "voices"],
+    queryFn: () => ctx.rest("/voices"),
+    refetchInterval: 30000
+  })
+
+  const data = voices.data || {}
+  const engine = data.engine || []
+  const local = data.local || []
+  const gallery = (data.gallery || {}).voices || []
+  const current = data.current || (status && status.voice) || ""
+
+  const localNames = new Set(local.map((v) => v.name))
+
+  const refresh = () => voices.refetch()
+
+  const selectVoice = (name) => {
+    setNote("")
+    ctx
+      .rest("/settings", { method: "POST", body: { voice: name } })
+      .then(() => {
+        setNote(`Voice set to ${name}`)
+        refresh()
+      })
+      .catch((err) => setNote(String((err && err.message) || err)))
+  }
+
+  const preview = (name) => {
+    if (player.playing === name) {
+      player.stop()
+      return
+    }
+    player.setBusy(name)
+    player.setError("")
+    ctx
+      .rest("/voices/preview", { method: "POST", body: { name }, timeoutMs: 240000 })
+      .then((res) => {
+        if (!res || !res.ok) {
+          player.setError((res && res.error) || "preview failed")
+          return
+        }
+        player.play(name, res.audio)
+      })
+      .catch((err) => player.setError(String((err && err.message) || err)))
+      .finally(() => player.setBusy(""))
+  }
+
+  const add = (voice) => {
+    setNote("")
+    ctx
+      .rest("/voices/add", { method: "POST", body: { name: voice.name, url: voice.url },
+        timeoutMs: 120000 })
+      .then((res) => {
+        if (!res || !res.ok) {
+          setNote((res && res.error) || "download failed")
+          return
+        }
+        setNote(`${voice.name} downloaded`)
+        refresh()
+      })
+      .catch((err) => setNote(String((err && err.message) || err)))
+  }
+
+  const remove = (voice) => {
+    setNote("")
+    ctx
+      .rest("/voices/remove", { method: "POST", body: { name: voice.name } })
+      .then(() => {
+        setNote(`${voice.name} removed`)
+        refresh()
+      })
+      .catch((err) => setNote(String((err && err.message) || err)))
+  }
+
+  const f = filter.trim().toLowerCase()
+  const match = (n) => !f || n.toLowerCase().includes(f)
+  const engineRows = engine.filter(match)
+  const localRows = local.filter((v) => match(v.name)).filter((v) => !engine.includes(v.name))
+  const galleryRows = gallery.filter((v) => match(v.name)).filter((v) => !localNames.has(v.name))
+
+  const rowBtn = (name, icon, title, onClick, disabled) =>
+    jsx("button", {
+      type: "button",
+      title,
+      disabled: Boolean(disabled),
+      onClick: (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        onClick()
+      },
+      className: cn(
+        "ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center rounded",
+        "text-muted-foreground hover:bg-(--chrome-action-hover) hover:text-foreground",
+        disabled && "opacity-40"
+      ),
+      children: jsx(Codicon, { name: icon, className: "text-[11px]" })
+    })
+
+  const row = (name, opts) =>
+    jsx("div", {
+      key: `${opts.kind}:${name}`,
+      className: cn(
+        "group flex items-center gap-1.5 rounded px-1.5 py-1 text-xs",
+        "hover:bg-(--chrome-action-hover) cursor-pointer"
+      ),
+      onClick: opts.onSelect || (() => selectVoice(name)),
+      children: [
+        jsx(Codicon, {
+          name: opts.selected ? "check" : "blank",
+          className: "shrink-0 text-[11px] text-muted-foreground"
+        }),
+        jsx("span", { className: "truncate", children: name }),
+        opts.badge
+          ? jsx("span", {
+            className: "ml-1 shrink-0 rounded bg-(--chrome-action-hover) px-1 "
+              + "text-[9px] uppercase text-muted-foreground",
+            children: opts.badge
+          })
+          : null,
+        opts.actions
+      ]
+    })
+
+  return jsx("div", {
+    className: "space-y-1.5",
+    children: [
+      jsx(Input, {
+        value: filter,
+        onChange: (e) => setFilter(e.target.value),
+        placeholder: "Filter voices…",
+        className: "h-7 text-xs"
+      }),
+      jsx(ScrollArea, {
+        className: "max-h-56",
+        children: jsx("div", {
+          className: "space-y-0.5 pr-1",
+          children: [
+            engineRows.length
+              ? [
+                jsx("div", { key: "h-engine", className: MENU_LABEL, children: "Engine voices" }),
+                ...engineRows.map((name) =>
+                  row(name, {
+                    kind: "engine",
+                    selected: name === current,
+                    actions: rowBtn(name, player.playing === name ? "debug-stop" : "play",
+                      "Preview", () => preview(name), player.busy === name)
+                  })
+                )
+              ]
+              : jsx("div", {
+                key: "no-engine",
+                className: NOTE,
+                children: engine.length ? "No engine voice matches" : "Engine unloaded"
+              }),
+            localRows.length
+              ? [
+                jsx("div", { key: "h-local", className: MENU_LABEL, children: "Downloaded" }),
+                ...localRows.map((v) =>
+                  row(v.name, {
+                    kind: "local",
+                    selected: v.name === current,
+                    badge: "clone",
+                    actions: [
+                      rowBtn(v.name, player.playing === v.name ? "debug-stop" : "play",
+                        "Preview", () => preview(v.name), player.busy === v.name),
+                      rowBtn(v.name, "trash", "Remove", () => remove(v))
+                    ]
+                  })
+                )
+              ]
+              : null,
+            jsx(DropdownMenuItem, {
+              key: "toggle-gallery",
+              onSelect: (e) => {
+                if (e && e.preventDefault) e.preventDefault()
+                setShowGallery(!showGallery)
+              },
+              children: [
+                jsx(Codicon, {
+                  name: showGallery ? "chevron-down" : "chevron-right",
+                  className: "mr-2 text-xs"
+                }),
+                `Open catalogue (${galleryRows.length})`
+              ]
+            }),
+            showGallery
+              ? (galleryRows.length
+                ? galleryRows.slice(0, 80).map((v) =>
+                  row(v.name, {
+                    kind: "gallery",
+                    selected: false,
+                    badge: "cc0",
+                    onSelect: () => preview(v.name),
+                    actions: [
+                      rowBtn(v.name, player.playing === v.name ? "debug-stop" : "play",
+                        "Preview", () => preview(v.name), player.busy === v.name),
+                      rowBtn(v.name, "cloud-download", "Download + add",
+                        () => add(v), player.busy === v.name)
+                    ]
+                  })
+                )
+                : jsx("div", {
+                  key: "no-gallery",
+                  className: NOTE,
+                  children: (data.gallery && data.gallery.error)
+                    ? data.gallery.error
+                    : "No catalogue voice matches"
+                }))
+              : null
+          ]
+        })
+      }),
+      player.error || note
+        ? jsx("div", { className: NOTE, children: player.error || note })
+        : jsx("div", {
+          className: NOTE,
+          children: "Play to audition, download to keep. Catalogue clips are CC0."
+        }),
+      jsx("div", {
+        className: NOTE,
+        children: `Playing: ${player.playing || "—"}`
+      })
+    ]
+  })
 }
 
 function ZonosChip({ ctx }) {
@@ -184,8 +484,8 @@ function ZonosChip({ ctx }) {
                 state.ok && state.pid
                   ? jsx('div', { children: `Process: ${state.pid}` })
                   : null,
-                state.ok && state.voices
-                  ? jsx('div', { children: `Voice: ${state.voice || '—'} (${state.voices} available)` })
+                state.ok
+                  ? jsx('div', { children: `Voice: ${state.voice || '—'}` })
                   : null,
                 state.ok
                   ? jsx('div', {
@@ -205,6 +505,9 @@ function ZonosChip({ ctx }) {
                   : null
               ]
             }),
+          jsx(DropdownMenuSeparator, {}),
+          jsx('div', { className: MENU_LABEL, children: 'Voice' }),
+          jsx(VoicePicker, { ctx, status: state }),
           jsx(DropdownMenuSeparator, {}),
           jsx('div', { className: MENU_LABEL, children: 'Unload after idle' }),
           jsx('div', {

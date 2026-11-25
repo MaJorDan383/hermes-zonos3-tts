@@ -1,8 +1,8 @@
 {
   "name": "zonos3-tts",
   "label": "ZONOS3-Mini",
-  "description": "ZONOS3-Mini engine residency: whether the model is loaded, how many surfaces hold it, the idle-unload and process-stop windows, and silent-output retries.",
+  "description": "ZONOS3-Mini engine residency, voice selection, and the open CC0 voice catalogue: preview a clip, download it, and speak in it.",
   "icon": "AudioWaveform",
-  "version": "1.16.1",
+  "version": "1.23.0",
   "api": "plugin_api.py"
 }

@@ -1,5 +1,5 @@
 name: zonos3-tts
-version: 1.22.0
+version: 1.23.0
 description: "ZONOS3-Mini text-to-speech on the native Zyphra ggml/CUDA runtime — lease-driven warm-up, idle VRAM unload by process stop, 27 built-in voices, SenseVoice speech recognition (optional STT provider) with emotion steering, and optional Windows audio ducking."
 license: "MIT"
 platforms: ["windows", "linux", "macos"]
