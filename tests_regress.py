@@ -190,6 +190,41 @@ _tempo_emitted = any("delivery.tempo" in _emo.reply_prosody(e, 1.0)
                      for e in _all_emo if _emo.REPLY_PROSODY.get(e, {}).get("tempo", 1.0) != 1.0)
 check("reply tempo is actually emitted", _tempo_emitted)
 
+print("\n== the reply settles across sentences ==")
+# steer_release is null on this bundle, so "meet then settle" cannot happen inside
+# one utterance -- only across the reply. The opening sentence must carry the full
+# stance and later ones must release toward the plain voice.
+_f = m._SETTLE_FACTORS
+check("settle starts at full stance", _f[0] == 1.0, str(_f))
+check("settle strictly decreases", all(a > b for a, b in zip(_f, _f[1:])), str(_f))
+check("settle ends nearer plain than start", _f[-1] < 0.5, str(_f))
+
+_st = _emo.reply_prosody("angry", 1.0)
+_scaled = {k: round(v * _f[1], 3) for k, v in _st.items()}
+check("scaling an armed stance reduces it",
+      all(abs(_scaled[k]) <= abs(_st[k]) for k in _st), f"{_st} -> {_scaled}")
+
+print("\n== raw steers are opt-in (they 400 without embedding mode) ==")
+check("sad emits no raw steer by default",
+      not any(k.startswith(("pitch.", "texture.")) for k in _emo.reply_prosody("sad", 1.0)),
+      str(_emo.reply_prosody("sad", 1.0)))
+check("sad emits its raw steer when allowed",
+      any(k.startswith("pitch.") for k in _emo.reply_prosody("sad", 1.0, allow_raw=True)),
+      str(_emo.reply_prosody("sad", 1.0, allow_raw=True)))
+
+print("\n== counter-affects contradict the user's affect ==")
+# A counter that agrees with the user is worse than none: disappointed as the
+# answer to frustration conceded that things were hopeless.
+check("frustration is answered with resolve, not regret",
+      _emo.REPLY_PROSODY["frustrated"]["secondary"]["direction"] == "proud",
+      str(_emo.REPLY_PROSODY["frustrated"]["secondary"]))
+check("frustration speeds up rather than hushing",
+      _emo.REPLY_PROSODY["frustrated"]["tempo"] > 1.0,
+      str(_emo.REPLY_PROSODY["frustrated"]["tempo"]))
+check("surprise arrives at clarity, not curiosity",
+      _emo.REPLY_PROSODY["surprised"]["emotion"] == "realizing",
+      str(_emo.REPLY_PROSODY["surprised"]))
+
 print("\n== prosody + emotion are level-safe ==")
 ctrl = m.emotion_controls("happy", 2.0)
 check("emotion cap applied",

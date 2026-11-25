@@ -106,6 +106,23 @@ _READ_BYTES = 65536
 # paths (_trim_edges and the incremental stream trim) cannot drift apart.
 _PAD_FLOOR = 32
 
+# "Meet, then settle" -- the only form of it this bundle allows.
+#
+# The module docstring describes the voice meeting the user's affect and then
+# settling toward calm. One utterance cannot do that: the bundle publishes
+# `steer_release: null`, and the server answers `steer_hold` below 1 with a 400
+# ("steer_hold below 1 needs a steering bundle with steer_release"). A dose is
+# therefore constant for the whole take -- there is no in-sentence decay.
+#
+# So the settle happens ACROSS the reply instead: the first sentence is spoken at
+# full dose (the "I heard you" beat), and each later sentence is scaled further
+# toward the plain voice. By the third sentence the reply is mostly itself, which
+# is the point -- a whole reply steeped in performed sympathy is worse than one
+# that acknowledges and then simply works.
+#
+# Index beyond the tuple holds at the last value.
+_SETTLE_FACTORS = (1.0, 0.75, 0.55, 0.45)
+
 # How much audio to hold back from a streamed sentence's tail so it can still be
 # trimmed. The engine pads ~240 ms at the end of a take; this must exceed that or
 # the trailing silence is emitted before the trim ever sees it.
@@ -1864,6 +1881,11 @@ class Zonos3TTS(TTSProvider):
         self._emotion_intensity = 1.0
         self._explicit_controls: dict[str, float] = {}
         self._emotion_lock = threading.Lock()
+        # The voice the most recent request spoke as; see speaker_embedding_available.
+        self._last_voice: Optional[str] = None
+        # How many utterances of the current reply have been spoken. Reset when a
+        # new turn arms a new reply; drives _SETTLE_FACTORS.
+        self._reply_uttered = 0
         # Always-on prosody shaping. These are not "emotions" — they set how
         # lively and how loud every utterance is, independent of affect.
         # pitch.pitch_range needs speaker_mode=embedding (a reference-clip voice
@@ -1929,7 +1951,8 @@ class Zonos3TTS(TTSProvider):
         self.stream_sample_rate = 44100  # provisional; the stream overwrites it
 
     def prosody_controls(self, has_clip_voice: bool = False,
-                         scale: float = 1.0) -> dict[str, float]:
+                         scale: float = 1.0,
+                         has_embedding: bool = True) -> dict[str, float]:
         """Always-on shaping applied on top of emotion controls.
 
         Measured on this host (baseline F0 spread 3.17 st):
@@ -1948,8 +1971,18 @@ class Zonos3TTS(TTSProvider):
         if self._volume_boost:
             out["delivery.loud"] = round(self._volume_boost * s, 3)
         # A reference-clip voice is conditioned on raw audio codes, so moving the
-        # embedding cannot apply; the engine 400s instead of ignoring it.
-        if self._dynamic_range and not has_clip_voice:
+        # embedding cannot apply; the engine 400s instead of ignoring it. The same
+        # is true when no voice resolves at all: with no speaker_embedding_id the
+        # payload carries no speaker_mode, and pitch.pitch_range is then a hard
+        # 400 that takes the whole utterance down. Measured: voice=None with
+        # dynamic_range=2.0 failed outright, so the guard has to cover it.
+        # `has_embedding` is what the REQUEST will carry, not what is configured.
+        # Those differ: without a per-call voice the payload resolves nothing, so
+        # no speaker_embedding_id and no speaker_mode are sent -- and a raw
+        # control is then a hard 400 that kills the utterance. Gating on config
+        # instead let the guard pass while the payload had nothing to steer,
+        # which is exactly how voice=None + dynamic_range failed.
+        if self._dynamic_range and not has_clip_voice and has_embedding:
             out["pitch.pitch_range"] = round(self._dynamic_range * s, 3)
         return out
 
@@ -2056,6 +2089,7 @@ class Zonos3TTS(TTSProvider):
         """
         with self._emotion_lock:
             self._explicit_controls = dict(controls or {})
+            self._reply_uttered = 0          # a new reply starts unsettled
             if not controls:
                 self._emotion = None
                 self._emotion_intensity = 1.0
@@ -2065,6 +2099,32 @@ class Zonos3TTS(TTSProvider):
             self._emotion = None
             self._emotion_intensity = 1.0
             self._explicit_controls = {}
+            self._reply_uttered = 0
+
+    def speaker_embedding_available(self, voice: Optional[str] = None) -> bool:
+        """True when a raw control (pitch.*, texture.*) would be accepted.
+
+        The server refuses raw controls with 400 unless the request runs
+        speaker_mode=embedding, and embedding mode is only requested when a
+        bundled voice resolves -- a cloning clip goes down the reference path,
+        which cannot re-project an embedding. This asks the same question the
+        payload builder asks, so the two cannot disagree.
+
+        *voice* is the effective voice for THIS request: the host passes it per
+        call, so the configured default is only a fallback. resolve_voice(None)
+        returns None, and treating that as "unavailable" would disable raw
+        controls for every install that relies on the server default -- which is
+        exactly the case that must not 400.
+        """
+        if not self.steering_supported:
+            return False
+        try:
+            effective = (voice
+                         or self._base_options.get("voice")
+                         or self._base_options.get("speaker"))
+            return bool(self._sup.resolve_voice(effective))
+        except Exception:  # noqa: BLE001 - a probe must not break speech
+            return False
 
     def current_emotion(self) -> Optional[str]:
         with self._emotion_lock:
@@ -2194,6 +2254,11 @@ class Zonos3TTS(TTSProvider):
             payload["speaker_mode"] = "reference"
         else:
             resolved = speaker if speaker else self._sup.resolve_voice(voice)
+            # Remember what this request will actually speak as, so a caller
+            # that needs to know whether raw controls are accepted (the emotion
+            # pipeline arming the reply voice) asks about the real voice rather
+            # than the configured default.
+            self._last_voice = voice or resolved
             if resolved:
                 payload["speaker_embedding_id"] = resolved
                 # `pitch.pitch_range` re-projects the speaker embedding, so the
@@ -2203,17 +2268,32 @@ class Zonos3TTS(TTSProvider):
                 # Requesting embedding mode keeps dynamic range working for
                 # every bundled voice without touching the cloning path.
                 if any(k.startswith("pitch.") for k in
-                       (self.prosody_controls(False) if self.steering_supported else {})):
+                       (self.prosody_controls(False, has_embedding=True)
+                        if self.steering_supported else {})):
                     payload["speaker_mode"] = "embedding"
 
         with self._emotion_lock:
             emotion = self._emotion
             intensity = self._emotion_intensity
             explicit = dict(self._explicit_controls)
+            uttered = self._reply_uttered
+            # Count this utterance as part of the current reply. Done here, in the
+            # one place every synthesis path funnels through, so the counter can
+            # never drift from what was actually spoken.
+            self._reply_uttered = uttered + 1
         controls: dict[str, float] = {}
         if explicit:
             # Pre-resolved reply prosody from EmotionPipeline wins: it already
-            # encoded "meet then settle", which a raw emotion label cannot.
+            # encoded the stance, which a raw emotion label cannot.
+            #
+            # Settle across the reply: full stance on the opening sentence, then
+            # progressively closer to the plain voice. This is the only form of
+            # "meet, then settle" the bundle permits -- see _SETTLE_FACTORS.
+            factor = _SETTLE_FACTORS[min(uttered, len(_SETTLE_FACTORS) - 1)]
+            if factor != 1.0:
+                explicit = {k: round(v * factor, 3) for k, v in explicit.items()}
+                logger.debug("zonos3-tts: reply sentence %d settled to %.0f%%",
+                             uttered + 1, factor * 100)
             controls.update(explicit)
         elif self._emotion_aware and emotion:
             wanted = emotion_controls(emotion, intensity)
@@ -2240,7 +2320,8 @@ class Zonos3TTS(TTSProvider):
             # so the engine cannot ramp it and a constant push accumulates.
             scale = self.steer_scale(text)
             for key, value in self.prosody_controls(
-                    bool(payload.get("speaker_audio_base64")), scale).items():
+                    bool(payload.get("speaker_audio_base64")), scale,
+                    has_embedding=bool(payload.get("speaker_embedding_id"))).items():
                 controls.setdefault(key, value)
         if controls:
             # A speaker may declare controls that do nothing for it
@@ -3370,8 +3451,14 @@ class EmotionPipeline:
             emotion = self._emotion
         if intensity is None:
             intensity = self._intensity
+        # `raw` steers (pitch.*, texture.*) move the speaker embedding and are a
+        # hard 400 unless the request runs speaker_mode=embedding. The provider
+        # only asks for that mode when a bundled voice resolved AND a pitch
+        # control is in play, so mirror that exactly rather than assume.
+        allow_raw = bool(self.provider.speaker_embedding_available(
+            self.provider._last_voice))
         controls = emotion_mod.reply_prosody(emotion, intensity,
-                                            enabled=self.prosody)
+                                            enabled=self.prosody, allow_raw=allow_raw)
         if controls:
             self.provider.set_emotion_controls(controls)
         else:

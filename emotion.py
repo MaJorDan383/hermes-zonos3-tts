@@ -176,17 +176,36 @@ def annotate_user_text(text: str, emotion: Optional[str], intensity: float = 0.0
 # steer would be an exact duplicate of another emotion's.
 REPLY_PROSODY: dict[str, dict] = {
     #                 primary steer              dose   tempo   secondary
+    #
+    # Two rules govern every row. First, MATCH AROUSAL, FLIP VALENCE: answering
+    # anger with "serene" alone drops both the energy and the feeling at once,
+    # which reads as deflating; serene + proud keeps some spine and only flips
+    # the valence, which is what calm authority actually sounds like.
+    #
+    # Second, the counter-affect must CONTRADICT the user's, not agree with it.
+    # "disappointed" as the counter to frustration agreed that things were
+    # hopeless -- the opposite of useful -- so it moved to angry's own counter.
     "angry":      {"emotion": "serene",     "dose": 0.70, "tempo": 0.95,
                    "secondary": {"direction": "proud", "dose": 0.20}},   # calm authority
-    "frustrated": {"emotion": "serene",     "dose": 0.70, "tempo": 0.98,
-                   "secondary": {"direction": "disappointed", "dose": 0.25}},  # steady, unimpressed
-    "sad":        {"emotion": "content",    "dose": 0.35, "tempo": 1.00},  # warm, not jubilant
-    "fearful":    {"emotion": "serene",     "dose": 0.80, "tempo": 0.92,
-                   "secondary": {"direction": "relieved", "dose": 0.20}},  # steady reassurance
+    # Frustration wants MOMENTUM, not hush. All three negative rows used to slow
+    # down; this one speeds up, because "let us go" is the useful answer to
+    # "this still is not working".
+    "frustrated": {"emotion": "serene",     "dose": 0.70, "tempo": 1.06,
+                   "secondary": {"direction": "proud", "dose": 0.22}},   # resolve, not regret
+    # "content" beside a sad person reads as satisfied, so the sympathy is
+    # carried by melody instead: a flattened pitch range is audible as quiet
+    # warmth without performing an upbeat mood.
+    "sad":        {"emotion": "content",    "dose": 0.32, "tempo": 1.00,
+                   "raw": {"pitch.pitch_range": -1.0}},                  # warm, subdued
+    "fearful":    {"emotion": "serene",     "dose": 0.55, "tempo": 0.92,
+                   "secondary": {"direction": "relieved", "dose": 0.30}},  # steady reassurance
     "happy":      {"emotion": "happy",      "dose": 0.40, "tempo": 1.05},  # share it lightly
     "excited":    {"emotion": "happy",      "dose": 0.50, "tempo": 1.08,
                    "secondary": {"direction": "ecstatic", "dose": 0.25}},  # genuine momentum
-    "surprised":  {"emotion": "interested", "dose": 0.40, "tempo": 1.02},
+    # "interested" only says "tell me more", which is the USER's job. "realizing"
+    # arrives at understanding, which is the assistant's.
+    "surprised":  {"emotion": "realizing",  "dose": 0.35, "tempo": 1.02,
+                   "secondary": {"direction": "interested", "dose": 0.15}},
     "disgusted":  {"emotion": "disgusted",  "dose": 0.35, "tempo": 1.00,
                    "secondary": {"direction": "content", "dose": 0.20}},  # distaste, staying civil
     "neutral":    {},
@@ -212,11 +231,12 @@ _REPLY_DIRECTIONS = {
     "relieved": "emotions.relieved",
     "ecstatic": "emotions.ecstatic",
     "disgusted": "emotions.disgusted",
+    "realizing": "emotions.realizing",
 }
 
 
 def reply_prosody(emotion: Optional[str], intensity: float = 0.0,
-                  *, enabled: bool = True) -> dict[str, float]:
+                  *, enabled: bool = True, allow_raw: bool = False) -> dict[str, float]:
     """ZONOS3 `controls` for the spoken reply.
 
     Returns ``{}`` for neutral (or when disabled) so the engine uses its own
@@ -244,6 +264,15 @@ def reply_prosody(emotion: Optional[str], intensity: float = 0.0,
     second = _REPLY_DIRECTIONS.get(secondary.get("direction", ""))
     if second:
         controls[second] = round(secondary.get("dose", 0.0) * scale, 2)
+
+    # A `raw` steer moves the speaker embedding rather than the hidden space,
+    # which the server refuses (400) unless the request asked for
+    # speaker_mode=embedding. Only bundled-voice installations run that way, so
+    # the caller decides whether raw controls may be appended -- sending one on a
+    # cloning path would take the whole utterance down.
+    if allow_raw:
+        for name, dose in (spec.get("raw") or {}).items():
+            controls[name] = round(float(dose) * scale, 3)
 
     # Tempo was carried in this table but never emitted -- reply_tempo() existed
     # and had no caller, so every tempo value here was dead. `delivery.tempo` is
@@ -394,10 +423,16 @@ def coverage_gaps(emotions) -> dict[str, list[str]]:
         secondary = (spec.get("secondary") or {}).get("direction")
         if secondary and secondary not in _REPLY_DIRECTIONS:
             gaps["directions"].append(f"{name}:{secondary}")
+        # `raw` names a direction directly (pitch.pitch_range), so it bypasses
+        # _REPLY_DIRECTIONS by design -- verify it is namespaced, not arbitrary.
+        for raw_name in (spec.get("raw") or {}):
+            if "." not in str(raw_name):
+                gaps["directions"].append(f"{name}:raw:{raw_name}")
         # Two emotions resolving to the SAME directions at the SAME doses are one
         # voice wearing two labels.
         key = (primary, round(float(spec.get("dose", 0)), 2),
-               secondary, round(float((spec.get("secondary") or {}).get("dose", 0)), 2))
+               secondary, round(float((spec.get("secondary") or {}).get("dose", 0)), 2),
+               tuple(sorted((spec.get("raw") or {}).items())))
         seen.setdefault(key, []).append(name)
     for key, names in seen.items():
         if len(names) > 1:
