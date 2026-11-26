@@ -485,6 +485,18 @@ def settings(payload: Dict[str, Any]) -> Any:
 # by cloning one clip from each and transcribing the result.
 CATALOGUES = [
     {
+        # The only one organised by STYLE rather than name: 24 perceptual groups
+        # ("Polished Broadcast Masculine · Authoritative", "Whispered Feminine
+        # Narrator · Calm ASMR"), each voice carrying tags, register, emotional
+        # range and even casting directions in a machine-readable manifest.
+        # 500 voices, CC-BY-4.0. Verified: 3/3 picks cloned at 14/14 words.
+        "label": "MOSS voice taxonomy (500 voices, 24 style groups, CC-BY)",
+        "url": "https://projects.laion.ai/moss-reference-voice-taxonomy/",
+        "speakers": 500,
+        "license": "cc-by-4.0",
+        "style_organised": True,
+    },
+    {
         # 995 distinct speakers, 30 s per clip, 48 kHz flac-backed WAV.
         # Apache-2.0. Best size/quality trade-off: chosen because it cloned
         # 3/3 speakers at 14/14 words with 5-14 s renders.
