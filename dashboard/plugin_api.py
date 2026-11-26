@@ -475,12 +475,43 @@ def settings(payload: Dict[str, Any]) -> Any:
 
 # --------------------------------------------------------------- voice selector
 
-# The open CC0 corpus this plugin's cloning was tested against. Linked, not
-# embedded: browsing and downloading voices belongs in a browser, and the plugin
-# only needs to offer what is already on disk. (An in-menu catalogue with live
-# previews was tried and removed -- every preview paid a cold engine start or a
-# reference-encoder reload, so the list was unusable at 1-2 min per click.)
-CATALOGUE_URL = "https://github.com/OwenTyme/voice-zero"
+# Catalogues worth pointing at, linked rather than embedded: browsing and
+# downloading belong in a browser, and the plugin only offers what is on disk.
+# (An in-menu catalogue with live previews was tried and removed -- every preview
+# paid a cold engine start or reference-encoder reload, so it was unusable at
+# 1-2 min per click.)
+#
+# Ordered by how many distinct speakers each one gives you. Verified on this host
+# by cloning one clip from each and transcribing the result.
+CATALOGUES = [
+    {
+        # 995 distinct speakers, 30 s per clip, 48 kHz flac-backed WAV.
+        # Apache-2.0. Best size/quality trade-off: chosen because it cloned
+        # 3/3 speakers at 14/14 words with 5-14 s renders.
+        "label": "LibriTTS voices (995 speakers, Apache-2.0)",
+        "url": "https://huggingface.co/datasets/sdialog/voices-libritts/tree/main/audio",
+        "speakers": 995,
+        "license": "apache-2.0",
+    },
+    {
+        # 154 speakers, 7-12 s clips, CC0. Small but licence-clean.
+        "label": "Voice-Zero (154 speakers, CC0)",
+        "url": "https://github.com/OwenTyme/voice-zero",
+        "speakers": 154,
+        "license": "cc0-1.0",
+    },
+    {
+        # 867 clips across 8 languages, ~5 s each, CC-BY-SA-4.0. Share-alike, so
+        # cloned output carries attribution obligations.
+        "label": "Open Swara (867 clips, 44 langs, CC-BY-SA)",
+        "url": "https://huggingface.co/datasets/jaymunshi/open-swara",
+        "speakers": 867,
+        "license": "cc-by-sa-4.0",
+    },
+]
+
+# Kept for the single-link callers already shipped.
+CATALOGUE_URL = CATALOGUES[0]["url"]
 
 # Downloaded clips live here. A user drops a file in and it shows up; the picker
 # never fetches anything itself.
@@ -539,4 +570,5 @@ def voices() -> Dict[str, Any]:
             "engine": sorted(engine, key=lambda v: v["label"].lower()),
             "local": _local_clips(),
             "catalogue_url": CATALOGUE_URL,
+            "catalogues": CATALOGUES,
             "gallery_dir": str(_gallery_root())}

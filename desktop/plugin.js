@@ -108,12 +108,11 @@ function VoicePicker({ ctx, status }) {
       .catch((err) => setNote(String((err && err.message) || err)))
   }
 
-  const openCatalogue = () => {
-    const url = data.catalogue_url || "https://github.com/OwenTyme/voice-zero"
+  const openUrl = (url) => {
     try {
       window.hermesDesktop?.openExternal?.(url)
     } catch {
-      /* a plain browser has no bridge; the link below still works */
+      /* a plain browser has no bridge; nothing to fall back to */
     }
   }
 
@@ -196,16 +195,19 @@ function VoicePicker({ ctx, status }) {
           ]
         })
       }),
-      jsx(DropdownMenuItem, {
-        onSelect: (e) => {
-          if (e && e.preventDefault) e.preventDefault()
-          openCatalogue()
-        },
-        children: [
-          jsx(Codicon, { name: "link-external", className: "mr-2 text-xs" }),
-          "Browse voice catalogue (CC0)"
-        ]
-      }),
+      ...(data.catalogues || []).map((c) =>
+        jsx(DropdownMenuItem, {
+          key: c.url,
+          onSelect: (e) => {
+            if (e && e.preventDefault) e.preventDefault()
+            openUrl(c.url)
+          },
+          children: [
+            jsx(Codicon, { name: "link-external", className: "mr-2 text-xs" }),
+            c.label
+          ]
+        })
+      ),
       note
         ? jsx("div", { className: NOTE, children: note })
         : jsx("div", {
