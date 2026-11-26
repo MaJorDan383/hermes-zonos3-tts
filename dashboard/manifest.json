@@ -3,6 +3,6 @@
   "label": "ZONOS3-Mini",
   "description": "ZONOS3-Mini engine residency, voice selection, and the open CC0 voice catalogue: preview a clip, download it, and speak in it.",
   "icon": "AudioWaveform",
-  "version": "1.27.0",
+  "version": "1.27.1",
   "api": "plugin_api.py"
 }

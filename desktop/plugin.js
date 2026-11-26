@@ -195,19 +195,16 @@ function VoicePicker({ ctx, status }) {
           ]
         })
       }),
-      ...(data.catalogues || []).map((c) =>
-        jsx(DropdownMenuItem, {
-          key: c.url,
-          onSelect: (e) => {
-            if (e && e.preventDefault) e.preventDefault()
-            openUrl(c.url)
-          },
-          children: [
-            jsx(Codicon, { name: "link-external", className: "mr-2 text-xs" }),
-            c.label
-          ]
-        })
-      ),
+      jsx(DropdownMenuItem, {
+        onSelect: (e) => {
+          if (e && e.preventDefault) e.preventDefault()
+          openUrl(data.catalogue_url || "https://projects.laion.ai/moss-reference-voice-taxonomy/")
+        },
+        children: [
+          jsx(Codicon, { name: "link-external", className: "mr-2 text-xs" }),
+          data.catalogue_label || "Browse voices by style"
+        ]
+      }),
       note
         ? jsx("div", { className: NOTE, children: note })
         : jsx("div", {

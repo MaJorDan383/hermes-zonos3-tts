@@ -483,47 +483,16 @@ def settings(payload: Dict[str, Any]) -> Any:
 #
 # Ordered by how many distinct speakers each one gives you. Verified on this host
 # by cloning one clip from each and transcribing the result.
-CATALOGUES = [
-    {
-        # The only one organised by STYLE rather than name: 24 perceptual groups
-        # ("Polished Broadcast Masculine · Authoritative", "Whispered Feminine
-        # Narrator · Calm ASMR"), each voice carrying tags, register, emotional
-        # range and even casting directions in a machine-readable manifest.
-        # 500 voices, CC-BY-4.0. Verified: 3/3 picks cloned at 14/14 words.
-        "label": "MOSS voice taxonomy (500 voices, 24 style groups, CC-BY)",
-        "url": "https://projects.laion.ai/moss-reference-voice-taxonomy/",
-        "speakers": 500,
-        "license": "cc-by-4.0",
-        "style_organised": True,
-    },
-    {
-        # 995 distinct speakers, 30 s per clip, 48 kHz flac-backed WAV.
-        # Apache-2.0. Best size/quality trade-off: chosen because it cloned
-        # 3/3 speakers at 14/14 words with 5-14 s renders.
-        "label": "LibriTTS voices (995 speakers, Apache-2.0)",
-        "url": "https://huggingface.co/datasets/sdialog/voices-libritts/tree/main/audio",
-        "speakers": 995,
-        "license": "apache-2.0",
-    },
-    {
-        # 154 speakers, 7-12 s clips, CC0. Small but licence-clean.
-        "label": "Voice-Zero (154 speakers, CC0)",
-        "url": "https://github.com/OwenTyme/voice-zero",
-        "speakers": 154,
-        "license": "cc0-1.0",
-    },
-    {
-        # 867 clips across 8 languages, ~5 s each, CC-BY-SA-4.0. Share-alike, so
-        # cloned output carries attribution obligations.
-        "label": "Open Swara (867 clips, 44 langs, CC-BY-SA)",
-        "url": "https://huggingface.co/datasets/jaymunshi/open-swara",
-        "speakers": 867,
-        "license": "cc-by-sa-4.0",
-    },
-]
-
-# Kept for the single-link callers already shipped.
-CATALOGUE_URL = CATALOGUES[0]["url"]
+# The one link the chip carries.
+#
+# Chosen because it is the only corpus organised by PERCEPTUAL STYLE rather than
+# by speaker name: 500 voices in 24 measured groups ("Polished Broadcast
+# Masculine · Authoritative", "Whispered Feminine Narrator · Calm ASMR"), each
+# record carrying tags, register and casting directions in one JSON manifest. The
+# name-list corpora (LibriTTS 995, Voice-Zero 154, Open Swara 867) are larger but
+# you have to audition them blind; noted here so the trade-off is not lost.
+CATALOGUE_URL = "https://projects.laion.ai/moss-reference-voice-taxonomy/"
+CATALOGUE_LABEL = "Browse voices by style (500, CC-BY)"
 
 # Downloaded clips live here. A user drops a file in and it shows up; the picker
 # never fetches anything itself.
@@ -582,5 +551,5 @@ def voices() -> Dict[str, Any]:
             "engine": sorted(engine, key=lambda v: v["label"].lower()),
             "local": _local_clips(),
             "catalogue_url": CATALOGUE_URL,
-            "catalogues": CATALOGUES,
+            "catalogue_label": CATALOGUE_LABEL,
             "gallery_dir": str(_gallery_root())}
