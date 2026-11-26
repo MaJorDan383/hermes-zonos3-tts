@@ -573,7 +573,7 @@ _PLUGIN_REPO = Path(__file__).resolve().parent.parent
 _ENGINE_REPO = Path(r"C:\Users\MaJor\Github\ZONOS3-Mini")
 _SENSEVOICE_MODEL = (Path.home() / ".dsh" / "speech-to-text" / "sensevoice"
                      / "models" / "sensevoice-onnx" / "model.int8.onnx")
-_ENGINE_SCRIPT = "scripts/update_zonos3_engine.sh"
+_ENGINE_SCRIPT = ("plugins/zonos3-tts/scripts/update_zonos3_engine.sh")
 
 
 def _git(repo: Path, *args: str, timeout: float = 25.0) -> Optional[str]:
