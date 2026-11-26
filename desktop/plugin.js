@@ -225,6 +225,15 @@ function ZonosChip({ ctx }) {
   const [unloadError, setError] = useState('')
   const [busyStt, setBusyStt] = useState(false)
   const [sttError, setSttError] = useState('')
+  const [checking, setChecking] = useState(false)
+
+  // Versions are slow-moving, so poll rarely. `fetch=0` keeps the poll off the
+  // network; the "Check now" row asks for fetch=1 explicitly.
+  const versions = useQuery({
+    queryKey: [ID, 'versions'],
+    queryFn: () => ctx.rest('/versions'),
+    refetchInterval: 300000
+  })
 
   // Clear a stale refusal as soon as the engine state changes.
   useEffect(() => {
@@ -353,6 +362,58 @@ function ZonosChip({ ctx }) {
           jsx(DropdownMenuSeparator, {}),
           jsx('div', { className: MENU_LABEL, children: 'Voice' }),
           jsx(VoicePicker, { ctx, status: state }),
+          jsx(DropdownMenuSeparator, {}),
+          jsx('div', { className: MENU_LABEL, children: 'Versions' }),
+          ...((versions.data && versions.data.items) || []).map((it) =>
+            jsx('div', {
+              key: it.name,
+              className: 'flex items-baseline gap-1.5 px-2 text-[0.6875rem]',
+              title: it.note || undefined,
+              children: [
+                jsx('span', { className: 'w-16 shrink-0 text-muted-foreground', children: it.name }),
+                jsx('span', { className: 'truncate font-mono', children: String(it.version) }),
+                it.state === 'behind'
+                  ? jsx(Codicon, {
+                    name: 'arrow-up',
+                    className: 'ml-auto shrink-0 text-[10px] text-(--ui-warning, #d19a66)'
+                  })
+                  : null
+              ]
+            })
+          ),
+          (versions.data && versions.data.items || []).some((i) => i.state === 'behind')
+            ? jsx('div', {
+              className: NOTE,
+              children: (() => {
+                const e = (versions.data.items || []).find((i) => i.state === 'behind')
+                return `Engine is ${e.behind} commit(s) behind and needs a REBUILD. `
+                  + `Run: bash ~/AppData/Local/hermes/${e.update_script}`
+              })()
+            })
+            : jsx('div', {
+              className: NOTE,
+              children: 'SenseVoice has no upstream ONNX to pull; its export is frozen.'
+            }),
+          jsx(DropdownMenuItem, {
+            disabled: Boolean(checking),
+            onSelect: (e) => {
+              if (e && e.preventDefault) e.preventDefault()
+              setChecking(true)
+              ctx
+                .rest('/versions?fetch=1', { timeoutMs: 60000 })
+                .then(() => versions.refetch())
+                .catch(() => {})
+                .finally(() => setChecking(false))
+            },
+            children: [
+              jsx(Codicon, {
+                name: checking ? 'sync' : 'refresh',
+                spinning: Boolean(checking),
+                className: 'mr-2 text-xs'
+              }),
+              checking ? 'Checking…' : 'Check engine for updates'
+            ]
+          }),
           jsx(DropdownMenuSeparator, {}),
           jsx('div', { className: MENU_LABEL, children: 'Unload after idle' }),
           jsx('div', {

@@ -553,3 +553,122 @@ def voices() -> Dict[str, Any]:
             "catalogue_url": CATALOGUE_URL,
             "catalogue_label": CATALOGUE_LABEL,
             "gallery_dir": str(_gallery_root())}
+
+
+# ---------------------------------------------------------------- versions
+#
+# Three layers update in three different ways, and conflating them is how people
+# end up believing "update" is one button:
+#
+#   plugin     python, self-updated by Hermes from its own git origin
+#   engine     a compiled CUDA binary -- needs a rebuild, not just a pull
+#   sensevoice a frozen 2024 ONNX export with no upstream ONNX to pull at all
+#
+# So this reports rather than acts. A control that rebuilt the engine in-process
+# would be able to leave the voice path with no working binary; the script at
+# scripts/update_zonos3_engine.sh does the rebuild with a build-then-swap and a
+# rollback, which is the part that must stay explicit.
+
+_PLUGIN_REPO = Path(__file__).resolve().parent.parent
+_ENGINE_REPO = Path(r"C:\Users\MaJor\Github\ZONOS3-Mini")
+_SENSEVOICE_MODEL = (Path.home() / ".dsh" / "speech-to-text" / "sensevoice"
+                     / "models" / "sensevoice-onnx" / "model.int8.onnx")
+_ENGINE_SCRIPT = "scripts/update_zonos3_engine.sh"
+
+
+def _git(repo: Path, *args: str, timeout: float = 25.0) -> Optional[str]:
+    """Run git in *repo*; None on any failure (missing repo, no git, offline)."""
+    try:
+        if not (repo / ".git").exists():
+            return None
+        out = subprocess.run(["git", "-C", str(repo), *args],
+                             capture_output=True, text=True, timeout=timeout,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                             if os.name == "nt" else 0)
+        return out.stdout.strip() if out.returncode == 0 else None
+    except Exception:  # noqa: BLE001 - a version probe must never raise
+        return None
+
+
+def _plugin_version() -> Dict[str, Any]:
+    version = ""
+    # A plain line scan, not a YAML parse: the dashboard process may not have
+    # PyYAML, and a version string does not need a parser. Strips the quotes a
+    # hand-edited yaml often carries.
+    try:
+        text = (_PLUGIN_REPO / "plugin.yaml").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith("version:"):
+                version = line.split(":", 1)[1].strip().strip('"').strip("'")
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    if not version:
+        # plugin.yaml is two levels up from dashboard/. If that path ever moves,
+        # fall back to the installed copy's manifest.
+        try:
+            man = json.loads((_PLUGIN_REPO / "dashboard" / "manifest.json")
+                             .read_text(encoding="utf-8"))
+            version = str(man.get("version") or "")
+        except Exception:  # noqa: BLE001
+            pass
+    head = _git(_PLUGIN_REPO, "rev-parse", "--short", "HEAD")
+    return {"name": "Plugin", "version": version or head or "unknown",
+            "commit": head, "state": "ok" if version else "unknown",
+            "note": "auto-updated by Hermes from its git origin"}
+
+
+def _engine_version(fetch: bool = False) -> Dict[str, Any]:
+    head = _git(_ENGINE_REPO, "rev-parse", "--short", "HEAD")
+    if head is None:
+        return {"name": "Engine", "version": "not a checkout",
+                "state": "unknown", "note": str(_ENGINE_REPO)}
+    branch = _git(_ENGINE_REPO, "rev-parse", "--abbrev-ref", "HEAD") or "main"
+    behind = None
+    remote = None
+    if fetch:
+        # Only fetched on demand: a background poll must not hit the network.
+        _git(_ENGINE_REPO, "fetch", "origin", "--quiet", timeout=45.0)
+    remote = _git(_ENGINE_REPO, "rev-parse", "--short", f"origin/{branch}")
+    try:
+        n = _git(_ENGINE_REPO, "rev-list", "--count", f"HEAD..origin/{branch}")
+        behind = int(n) if n is not None else None
+    except (TypeError, ValueError):
+        behind = None
+    binary = _ENGINE_REPO / "servers" / "ggml" / "build-cuda" / "zonos3-server.exe"
+    state = "ok" if behind == 0 else ("behind" if behind else "unknown")
+    note = ("up to date" if behind == 0 else
+            f"{behind} commit(s) behind {remote}; rebuild needed (not just a pull)"
+            if behind else "update state unknown (offline?)")
+    return {"name": "Engine", "version": head, "branch": branch,
+            "behind": behind, "remote": remote, "state": state, "note": note,
+            "binary_present": binary.is_file(),
+            "update_script": _ENGINE_SCRIPT}
+
+
+def _sensevoice_version() -> Dict[str, Any]:
+    exists = _SENSEVOICE_MODEL.is_file()
+    stamp = ""
+    if exists:
+        import datetime
+        stamp = datetime.date.fromtimestamp(
+            _SENSEVOICE_MODEL.stat().st_mtime).isoformat()
+    return {"name": "SenseVoice", "version": stamp or "missing",
+            "state": "frozen" if exists else "missing",
+            "note": ("no upstream ONNX to pull; FunAudioLLM ships only model.pt "
+                     "and the sherpa-onnx export is frozen at 2024-07-17")}
+
+
+@router.get("/versions")
+def versions(fetch: int = 0) -> Dict[str, Any]:
+    """Version + update state for the three layers.
+
+    ``?fetch=1`` performs the upstream git fetch (a network call) so the engine's
+    behind-count is accurate. The default does not touch the network: the chip
+    polls, and a status poll must stay cheap.
+    """
+    return {"ok": True, "items": [
+        _plugin_version(),
+        _engine_version(fetch=bool(fetch)),
+        _sensevoice_version(),
+    ]}
