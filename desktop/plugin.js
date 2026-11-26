@@ -348,9 +348,16 @@ function VoicePicker({ ctx, status }) {
                 : jsx("div", {
                   key: "no-gallery",
                   className: NOTE,
-                  children: (data.gallery && data.gallery.error)
-                    ? data.gallery.error
-                    : "No catalogue voice matches"
+                  // A 404 here is not an empty catalogue: the plugin host caches
+                  // dashboard/plugin_api.py once in `asgi_apps`, and a gateway that
+                  // predates the /voices route keeps serving the old router until
+                  // its process restarts. Say that instead of implying the corpus
+                  // vanished.
+                  children: voices.error
+                    ? `Voice browser unavailable: ${String((voices.error && voices.error.message) || voices.error)}. Restart the gateway from a separate terminal.`
+                    : ((data.gallery && data.gallery.error)
+                      ? data.gallery.error
+                      : "No catalogue voice matches")
                 }))
               : null
           ]
