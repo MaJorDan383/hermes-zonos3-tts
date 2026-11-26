@@ -178,13 +178,18 @@ function VoicePicker({ ctx, status }) {
     }
     player.setBusy(name)
     player.setError("")
+    // A cold engine load is ~100 s (3.3 GB of weights plus the CUDA context) and
+    // a cold reference encoder adds ~90 s more, so say so instead of leaving a
+    // spinning icon that looks wedged.
+    setNote("Rendering preview… a cold engine takes ~1-2 min, warm is seconds")
     ctx
-      .rest("/voices/preview", { method: "POST", body: { name }, timeoutMs: 240000 })
+      .rest("/voices/preview", { method: "POST", body: { name }, timeoutMs: 300000 })
       .then((res) => {
         if (!res || !res.ok) {
           player.setError((res && res.error) || "preview failed")
           return
         }
+        setNote("")
         player.play(name, res.audio)
       })
       .catch((err) => player.setError(String((err && err.message) || err)))
